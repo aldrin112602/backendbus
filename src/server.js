@@ -96,7 +96,14 @@ app.use((err, req, res, next) => {
 app.use('/webhook', express.raw({ type: 'application/json' }));
 
 app.get(['/health', '/api/health'], (req, res) => {
-  res.json({ ok: true });
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).json({
+    ok: true,
+    status: 'healthy',
+    service: 'bus-tracking-backend',
+    uptime: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Helper: send simple receipt email via SendGrid (if configured)
