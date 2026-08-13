@@ -1,13 +1,12 @@
 // Get notifications for a specific client by user id
+require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const Stripe = require('stripe');
 const crypto = require('crypto');
 const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 
-dotenv.config();
 const app = express();
 
 function normalizeLatLng(value) {
@@ -71,6 +70,12 @@ if (sgMail) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const passwordOtpStore = new Map();
 const latestLocationsByBusId = new Map();
 const liveLocationClients = new Set();
+
+function getBearerToken(req) {
+  const header = req.headers.authorization || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
 
 // Middleware
 app.use(cors());
@@ -3453,6 +3458,50 @@ app.post('/api/auth/login', async (req, res) => {
     // Fallback - return generic server error
     return res.status(500).json({ error: (error && error.message) ? error.message : String(error) });
   }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'No authentication token provided' });
+    }
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: error?.message || 'Invalid authentication token' });
+    }
+
+    const authUser = data.user;
+    let profile = null;
+    try {
+      const { data: userRow } = await supabase
+        .from('users')
+        .select('id, username, email, role, profile')
+        .eq('id', authUser.id)
+        .single();
+      profile = userRow || null;
+    } catch (_) {
+      profile = null;
+    }
+
+    return res.json({
+      user: {
+        id: authUser.id,
+        email: authUser.email,
+        username: profile?.username || authUser.user_metadata?.username || '',
+        role: profile?.role || authUser.user_metadata?.role || 'client',
+        profile: profile?.profile || authUser.user_metadata || {},
+        user_metadata: authUser.user_metadata || {},
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to get current user' });
+  }
+});
+
+app.post('/api/auth/logout', async (_req, res) => {
+  return res.json({ success: true, message: 'Logout successful' });
 });
 
 app.post('/api/auth/send-otp', async (req, res) => {
