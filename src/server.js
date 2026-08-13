@@ -29,6 +29,13 @@ function normalizeLatLng(value) {
   return { lat, lng };
 }
 
+function broadcastLiveLocation(payload) {
+  const message = `data: ${JSON.stringify({ type: 'location_update', data: payload })}\n\n`;
+  for (const client of liveLocationClients) {
+    client.write(message);
+  }
+}
+
 // Initialize Stripe and SendGrid if keys are present
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' }) : null;
 
@@ -62,6 +69,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 const supabaseAdmin = process.env.SUPABASE_SERVICE_ROLE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY) : null;
 if (sgMail) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const passwordOtpStore = new Map();
+const latestLocationsByBusId = new Map();
+const liveLocationClients = new Set();
 
 // Middleware
 app.use(cors());
@@ -80,6 +89,10 @@ app.use((err, req, res, next) => {
 
 // For Stripe webhook handling
 app.use('/webhook', express.raw({ type: 'application/json' }));
+
+app.get(['/health', '/api/health'], (req, res) => {
+  res.json({ ok: true });
+});
 
 // Helper: send simple receipt email via SendGrid (if configured)
 // Create a Stripe checkout session
@@ -3135,6 +3148,120 @@ app.get('/api/admin/bus-locations', async (req, res) => {
   }
 });
 
+// Receive live location updates from employee devices.
+app.put('/api/employee/location', async (req, res) => {
+  try {
+    const { lat, lng, employeeId, busId, accuracy, speed, heading } = req.body || {};
+
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ message: 'lat and lng are required numbers' });
+    }
+
+    const payload = {
+      lat,
+      lng,
+      accuracy: typeof accuracy === 'number' ? accuracy : null,
+      speed: typeof speed === 'number' ? speed : null,
+      heading: typeof heading === 'number' ? heading : null,
+      employeeId: employeeId || null,
+      busId: busId || null,
+      timestamp: new Date().toISOString(),
+    };
+
+    if (payload.busId) {
+      latestLocationsByBusId.set(payload.busId, payload);
+
+      await supabase
+        .from('buses')
+        .update({ current_location: { lat: payload.lat, lng: payload.lng } })
+        .eq('id', payload.busId);
+    }
+
+    try {
+      await supabase.from('bus_locations').insert({
+        bus_id: payload.busId,
+        employee_id: payload.employeeId,
+        lat: payload.lat,
+        lng: payload.lng,
+        accuracy: payload.accuracy,
+        speed: payload.speed,
+        heading: payload.heading,
+        recorded_at: payload.timestamp,
+      });
+    } catch (locationLogError) {
+      console.warn('bus_locations insert skipped:', locationLogError?.message || locationLogError);
+    }
+
+    broadcastLiveLocation(payload);
+    res.json({ success: true, location: payload });
+  } catch (error) {
+    console.error('Location update failed:', error);
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
+});
+
+// Admin: latest location for one bus.
+app.get('/api/admin/bus/:busId/location', async (req, res) => {
+  try {
+    const { busId } = req.params;
+    const latest = latestLocationsByBusId.get(busId);
+    if (latest) return res.json({ busId, latest });
+
+    const { data, error } = await supabase
+      .from('buses')
+      .select('current_location')
+      .eq('id', busId)
+      .single();
+
+    if (error) throw error;
+    const currentLocation = normalizeLatLng(data?.current_location);
+    res.json({
+      busId,
+      latest: currentLocation ? { ...currentLocation, busId, timestamp: null } : null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: list latest known locations for all buses.
+app.get('/api/admin/locations', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('buses')
+      .select('id, current_location');
+
+    if (error) throw error;
+
+    const locations = (data || [])
+      .map((bus) => {
+        const live = latestLocationsByBusId.get(bus.id);
+        const fallback = normalizeLatLng(bus.current_location);
+        const latest = live || (fallback ? { ...fallback, busId: bus.id, timestamp: null } : null);
+        return latest ? { busId: bus.id, latest } : null;
+      })
+      .filter(Boolean);
+
+    res.json(locations);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: subscribe to live location updates with Server-Sent Events.
+app.get('/api/admin/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  res.write(': connected\n\n');
+
+  liveLocationClients.add(res);
+  req.on('close', () => {
+    liveLocationClients.delete(res);
+  });
+});
+
 // --- Client API ---
 
 // Get all buses for client (with route info)
@@ -3168,34 +3295,8 @@ app.get('/api/client/bus-eta', async (req, res) => {
 
     if (error) throw error;
 
-    const trackingBaseUrl =
-      process.env.TRACKING_SERVER_URL ||
-      process.env.VITE_TRACKING_URL ||
-      process.env.TRACKING_URL ||
-      null;
-
-    let latestByBusId = null;
-    if (trackingBaseUrl) {
-      try {
-        const base = String(trackingBaseUrl).replace(/\/$/, '');
-        const r = await fetch(`${base}/api/admin/locations`);
-        if (r.ok) {
-          const json = await r.json();
-          if (Array.isArray(json)) {
-            latestByBusId = new Map(
-              json
-                .filter((x) => x && typeof x === 'object' && x.busId)
-                .map((x) => [x.busId, x.latest])
-            );
-          }
-        }
-      } catch (_) {
-        latestByBusId = null;
-      }
-    }
-
     const etas = buses.map(bus => {
-      const tracked = latestByBusId?.get(bus.id);
+      const tracked = latestLocationsByBusId.get(bus.id);
       const currentLocation =
         normalizeLatLng(tracked) || normalizeLatLng(bus.current_location);
 
@@ -3903,8 +4004,13 @@ app.get('/api/employee/my-bus', async (req, res) => {
       }
     }
 
+    const liveLocation = employee.assigned_bus_id
+      ? latestLocationsByBusId.get(employee.assigned_bus_id)
+      : null;
+
     const bus = employee.bus ? {
       ...employee.bus,
+      current_location: normalizeLatLng(liveLocation) || employee.bus.current_location,
       route: route ? {
         ...route,
         start_terminal_name: startName,
