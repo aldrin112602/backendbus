@@ -4051,12 +4051,14 @@ app.get('/api/employee/my-bus', async (req, res) => {
       const ids = [route.start_terminal_id, route.end_terminal_id].filter(Boolean);
       const { data: terminals } = await supabase
         .from('terminals')
-        .select('id, name')
+        .select('id, name, lat, lng, address, formatted_address')
         .in('id', ids);
       if (terminals && terminals.length) {
-        const map = new Map(terminals.map(t => [t.id, t.name]));
-        startName = map.get(route.start_terminal_id) || null;
-        endName = map.get(route.end_terminal_id) || null;
+        const map = new Map(terminals.map(t => [t.id, t]));
+        startName = map.get(route.start_terminal_id)?.name || null;
+        endName = map.get(route.end_terminal_id)?.name || null;
+        route.start_terminal = map.get(route.start_terminal_id) || null;
+        route.end_terminal = map.get(route.end_terminal_id) || null;
       }
     }
 
