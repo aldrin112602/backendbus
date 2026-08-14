@@ -3849,9 +3849,9 @@ app.post('/api/admin/employee/create', async (req, res) => {
     }
 
     // Validate role
-    if (!['driver', 'conductor'].includes(role)) {
+    if (!['driver', 'conductor', 'employee'].includes(role)) {
       return res.status(400).json({
-        error: 'Role must be either "driver" or "conductor"'
+        error: 'Role must be "driver", "conductor", or "employee"'
       });
     }
 
@@ -3863,6 +3863,10 @@ app.post('/api/admin/employee/create', async (req, res) => {
       });
     }
 
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role not configured' });
+    }
+
     // Check if email already exists (use admin client to bypass RLS)
     const { data: existingEmployees, error: existingErr } = await supabaseAdmin
       .from('users')
@@ -3871,10 +3875,6 @@ app.post('/api/admin/employee/create', async (req, res) => {
     if (existingErr) throw existingErr;
     if (Array.isArray(existingEmployees) && existingEmployees.length > 0) {
       return res.status(400).json({ error: 'Email already exists' });
-    }
-
-    if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Supabase service role not configured' });
     }
 
     const { data: authAdminData, error: authAdminError } = await supabaseAdmin.auth.admin.createUser({
@@ -3908,7 +3908,7 @@ app.post('/api/admin/employee/create', async (req, res) => {
       .single();
     if (userError) throw userError;
 
-    if (busId) {
+    if (busId && ['driver', 'conductor'].includes(role)) {
       const updateField = role === 'driver' ? 'driver_id' : 'conductor_id';
       await supabaseAdmin
         .from('buses')
@@ -4115,16 +4115,29 @@ app.put('/api/admin/employee/assign-bus', async (req, res) => {
       .update({ assigned_bus_id: busId })
       .eq('email', email);
 
-    // Update bus assignment
-    const updateField = employee.role === 'driver' ? 'driver_id' : 'conductor_id';
-    const { data: updatedBus, error: busError } = await supabase
-      .from('buses')
-      .update({ [updateField]: employee.id })
-      .eq('id', busId)
-      .select()
-      .single();
+    let updatedBus = null;
+    if (['driver', 'conductor'].includes(employee.role)) {
+      // Update bus crew assignment only for roles with dedicated bus columns.
+      const updateField = employee.role === 'driver' ? 'driver_id' : 'conductor_id';
+      const { data: busData, error: busError } = await supabase
+        .from('buses')
+        .update({ [updateField]: employee.id })
+        .eq('id', busId)
+        .select()
+        .single();
 
-    if (busError) throw busError;
+      if (busError) throw busError;
+      updatedBus = busData;
+    } else {
+      const { data: busData, error: busError } = await supabase
+        .from('buses')
+        .select()
+        .eq('id', busId)
+        .single();
+
+      if (busError) throw busError;
+      updatedBus = busData;
+    }
 
     res.json({
       message: `${employee.role} ${employee.profile?.fullName || employee.username} assigned to bus successfully`,
