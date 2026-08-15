@@ -3302,16 +3302,20 @@ app.get('/api/client/bus-eta', async (req, res) => {
   try {
     const { data: buses, error } = await supabase
       .from('buses')
-      .select('id, bus_number, current_location, route:routes(name, start_terminal_id, end_terminal_id)')
+      .select(`
+        id, bus_number, current_location,
+        departure_status, scheduled_departure_time, actual_departure_time, departure_status_note,
+        route:routes(name, start_terminal_id, end_terminal_id)
+      `)
       .eq('status', 'active');
-
+ 
     if (error) throw error;
-
+ 
     const etas = buses.map(bus => {
       const tracked = latestLocationsByBusId.get(bus.id);
       const currentLocation =
         normalizeLatLng(tracked) || normalizeLatLng(bus.current_location);
-
+ 
       return {
         busId: bus.id,
         busNumber: bus.bus_number,
@@ -3319,9 +3323,13 @@ app.get('/api/client/bus-eta', async (req, res) => {
         currentLocation,
         route: bus.route,
         locationSource: tracked ? 'employee_live' : currentLocation ? 'database' : null,
+        departureStatus: bus.departure_status || null,
+        scheduledDepartureTime: bus.scheduled_departure_time || null,
+        actualDepartureTime: bus.actual_departure_time || null,
+        departureStatusNote: bus.departure_status_note || null,
       };
     });
-
+ 
     res.json(etas);
   } catch (error) {
     res.status(500).json({ error: error.message });
