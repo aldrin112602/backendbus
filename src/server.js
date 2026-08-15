@@ -3467,6 +3467,59 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+
+app.put('/api/employee/bus-status/:busId', async (req, res) => {
+  try {
+    const { busId } = req.params;
+    const {
+      status,
+      scheduled_departure_time, 
+      actual_departure_time, 
+      status_note, 
+    } = req.body || {};
+
+    const allowedStatuses = ['scheduled', 'departed', 'delayed', 'arrived', 'cancelled'];
+    if (!status || !allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid or missing status', allowedStatuses });
+    }
+    const { data: existingBus, error: existingError } = await supabase
+      .from('buses')
+      .select('id')
+      .eq('id', busId)
+      .single();
+    if (existingError || !existingBus) {
+      return res.status(404).json({ error: 'Bus not found' });
+    }
+
+    const updatePayload = {
+      departure_status: status,
+      scheduled_departure_time: scheduled_departure_time || null,
+      actual_departure_time: actual_departure_time || null,
+      departure_status_note: status_note || null,
+      departure_status_updated_at: new Date().toISOString(),
+    };
+
+    const { data: updatedBus, error: updateError } = await supabase
+      .from('buses')
+      .update(updatePayload)
+      .eq('id', busId)
+      .select(`
+        *,
+        driver:driver_id(id, username, email, profile),
+        conductor:conductor_id(id, username, email, profile),
+        route:route_id(name, start_terminal_id, end_terminal_id)
+      `)
+      .single();
+
+    if (updateError) throw updateError;
+
+    res.json(updatedBus);
+  } catch (error) {
+    console.error('Failed to update bus departure status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/auth/me', async (req, res) => {
   try {
     const token = getBearerToken(req);
