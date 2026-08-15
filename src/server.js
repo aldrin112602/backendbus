@@ -4088,6 +4088,10 @@ app.get('/api/employee/my-bus', async (req, res) => {
           status,
           driver_id,
           conductor_id,
+          departure_status,
+          scheduled_departure_time,
+          actual_departure_time,
+          departure_status_note,
           driver:driver_id(id, username, email, profile),
           conductor:conductor_id(id, username, email, profile),
           route:route_id(name, start_terminal_id, end_terminal_id)
