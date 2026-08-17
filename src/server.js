@@ -3543,13 +3543,16 @@ app.get('/api/auth/me', async (req, res) => {
     const authUser = data.user;
     let profile = null;
     try {
-      const { data: userRow } = await supabase
+      const client = supabaseAdmin || supabase;
+      const { data: userRow, error: userRowError } = await client
         .from('users')
         .select('id, username, email, role, profile')
         .eq('id', authUser.id)
         .single();
+      if (userRowError) console.error('auth/me: users lookup failed:', userRowError);
       profile = userRow || null;
-    } catch (_) {
+    } catch (e) {
+      console.error('auth/me: users lookup threw:', e);
       profile = null;
     }
 
