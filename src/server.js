@@ -114,7 +114,17 @@ app.post('/api/create-payment-session', async (req, res) => {
   }
 
   try {
-    const { userId, busId, seats, totalPrice, routeName, date } = req.body;
+    const { userId, busId, seats, routeName, date } = req.body;
+    const seatCount = Array.isArray(seats) && seats.length ? seats.length : 1;
+    const { data: fareBus, error: fareBusError } = await supabase
+      .from('buses')
+      .select('route:routes(fare_per_seat)')
+      .eq('id', busId)
+      .single();
+    if (fareBusError || !fareBus) {
+      return res.status(400).json({ error: 'Invalid busId' });
+    }
+    const totalPrice = Number((Number(fareBus.route?.fare_per_seat ?? 15) * seatCount).toFixed(2));
 
     // Create a pending booking in the database
     const { data: booking, error: bookingError } = await supabase
@@ -144,12 +154,12 @@ app.post('/api/create-payment-session', async (req, res) => {
       payment_method_types: ['card'],
       line_items: [{
         price_data: {
-          currency: 'usd',
+          currency: 'php',
           product_data: {
             name: `Bus Booking - ${routeName}`,
             description: `${seats.length} seat(s) for ${date}`,
           },
-          unit_amount: totalPrice * 100, // Stripe expects amounts in cents
+          unit_amount: Math.round(totalPrice * 100), // Stripe expects amounts in centavos for PHP
         },
         quantity: 1,
       }],
@@ -243,10 +253,8 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
   const safeSeats = Array.isArray(seats) ? seats.join(', ') : (seats || 'N/A');
   const safeRoute = routeName || 'N/A';
   const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
-  const rate = 58.74;
-  const usdNum = typeof totalPrice === 'number' ? totalPrice : Number(totalPrice || 0);
-  const phpApprox = (usdNum * rate).toFixed(2);
-  const safeTotal = `$${usdNum} (≈ ₱${phpApprox} PHP)`;
+  const phpNum = typeof totalPrice === 'number' ? totalPrice : Number(totalPrice || 0);
+  const safeTotal = `₱${phpNum.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const html = `
   <div style="background-color:#f6f7fb;padding:24px 0;margin:0;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
@@ -286,8 +294,7 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
                   <tr style="background-color:#f9fafb;">
                     <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Total Paid</td>
                     <td style="padding:12px 16px;">
-                      <div style="font-size:14px;color:#db2777;font-weight:700;margin-bottom:2px;">$${usdNum}</div>
-                      <div style="font-size:12px;color:#111827;font-weight:600;">≈ ₱${phpApprox} PHP</div>
+                      <div style="font-size:14px;color:#db2777;font-weight:700;margin-bottom:2px;">${safeTotal}</div>
                     </td>
                   </tr>
                 </table>
@@ -686,7 +693,6 @@ app.post('/api/client/booking', async (req, res) => {
       date,
       email,
       payment_method,
-      amount,
       pickup_address,
       pickup_lat,
       pickup_lng,
@@ -724,10 +730,32 @@ app.post('/api/client/booking', async (req, res) => {
     }
 
     const travelDate = travel_date || date || null;
-    const resolvedAmount =
-      typeof amount === 'number' && Number.isFinite(amount)
-        ? amount
-        : 15 * seatList.length;
+
+    const { data: busForFare, error: busForFareError } = await supabase
+      .from('buses')
+      .select('route_id, route:routes(fare_per_seat)')
+      .eq('id', busId)
+      .single();
+    if (busForFareError || !busForFare) {
+      return res.status(400).json({ error: 'Invalid busId' });
+    }
+
+    let discountMultiplier = 1.0;
+    if (resolvedUserId) {
+      const { data: discount } = await supabase
+        .from('discount_verifications')
+        .select('status')
+        .eq('user_id', resolvedUserId)
+        .eq('status', 'approved')
+        .maybeSingle();
+
+      if (discount) {
+        discountMultiplier = 0.8;
+      }
+    }
+
+    const farePerSeat = Number(busForFare.route?.fare_per_seat ?? 15);
+    const resolvedAmount = Number((farePerSeat * seatList.length * discountMultiplier).toFixed(2));
 
     const pickupPayload =
       pickup_lat != null &&
@@ -832,7 +860,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured on server.' });
 
-    const { userId, email, busId, seats = [], date, totalAmount } = req.body;
+    const { userId, email, busId, seats = [], date } = req.body;
     if (!userId || !busId || !email) return res.status(400).json({ error: 'userId, email and busId are required' });
 
     const isValidUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -851,8 +879,9 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       }
     }
 
-    // Resolve route name from bus -> routes
+    // Resolve route name and fare from bus -> routes
     let resolvedRouteName = null;
+    let farePerSeat = 15;
     try {
       const { data: busRow } = await supabase
         .from('buses')
@@ -863,10 +892,11 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       if (routeId) {
         const { data: routeRow } = await supabase
           .from('routes')
-          .select('name')
+          .select('name, fare_per_seat')
           .eq('id', routeId)
           .single();
         resolvedRouteName = routeRow?.name || null;
+        farePerSeat = Number(routeRow?.fare_per_seat ?? 15);
       }
     } catch (_) {
       // best-effort only
@@ -880,7 +910,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
         .select('status')
         .eq('user_id', resolvedUserId)
         .eq('status', 'approved')
-        .single();
+        .maybeSingle();
       
       if (discount) {
         discountMultiplier = 0.8; // 20% discount
@@ -888,9 +918,8 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     }
 
     // Calculate amount with discount
-    const basePrice = 15;
     const seatCount = (seats && seats.length) || 1;
-    const finalAmount = (basePrice * seatCount) * discountMultiplier;
+    const finalAmount = Number((farePerSeat * seatCount * discountMultiplier).toFixed(2));
 
     // Create booking with pending payment
     const bookingPayload = {
@@ -925,7 +954,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: 'php',
             product_data: { 
               name: `AuroRide — ${resolvedRouteName || booking.id}`,
               description: `${seatCount} seat(s) for ${date || 'selected date'}`
@@ -2625,8 +2654,9 @@ app.put('/api/admin/refund/:id/status', async (req, res) => {
 app.post('/api/admin/route', async (req, res) => {
   try {
     const { name, start_terminal_id, end_terminal_id, stops } = req.body;
+    const fare_per_seat = req.body.fare_per_seat == null ? 15 : Number(req.body.fare_per_seat);
     
-    console.log('Creating route with data:', { name, start_terminal_id, end_terminal_id, stops });
+    console.log('Creating route with data:', { name, start_terminal_id, end_terminal_id, fare_per_seat, stops });
     
     // Validate required fields
     if (!name || !start_terminal_id || !end_terminal_id) {
@@ -2635,6 +2665,9 @@ app.post('/api/admin/route', async (req, res) => {
         required: ['name', 'start_terminal_id', 'end_terminal_id'],
         received: { name, start_terminal_id, end_terminal_id }
       });
+    }
+    if (!Number.isFinite(fare_per_seat) || fare_per_seat < 0) {
+      return res.status(400).json({ error: 'fare_per_seat must be a valid non-negative number' });
     }
 
     // Check if terminals exist
@@ -2659,7 +2692,7 @@ app.post('/api/admin/route', async (req, res) => {
     // Create route
     const { data: route, error: routeError } = await supabase
       .from('routes')
-      .insert([{ name, start_terminal_id, end_terminal_id }])
+      .insert([{ name, start_terminal_id, end_terminal_id, fare_per_seat }])
       .select()
       .single();
     
@@ -2749,10 +2782,14 @@ app.put('/api/admin/route/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { name, start_terminal_id, end_terminal_id, stops } = req.body;
+    const fare_per_seat = req.body.fare_per_seat == null ? 15 : Number(req.body.fare_per_seat);
 
     // Validate required fields
     if (!name || !start_terminal_id || !end_terminal_id) {
       return res.status(400).json({ error: 'Name, start_terminal_id, and end_terminal_id are required' });
+    }
+    if (!Number.isFinite(fare_per_seat) || fare_per_seat < 0) {
+      return res.status(400).json({ error: 'fare_per_seat must be a valid non-negative number' });
     }
 
     // Check if route exists
@@ -2781,7 +2818,7 @@ app.put('/api/admin/route/:id', async (req, res) => {
     // Update route
     const { data: updatedRoute, error: routeError } = await supabase
       .from('routes')
-      .update({ name, start_terminal_id, end_terminal_id })
+      .update({ name, start_terminal_id, end_terminal_id, fare_per_seat })
       .eq('id', id)
       .select()
       .single();
@@ -3281,14 +3318,15 @@ app.get('/api/client/buses', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('buses')
-      .select('*, route:routes(name)')
+      .select('*, route:routes(name, fare_per_seat)')
       .eq('status', 'active');
 
     if (error) throw error;
     
     const transformed = data.map(bus => ({
       ...bus,
-      route_name: bus.route?.name
+      route_name: bus.route?.name,
+      fare_per_seat: bus.route?.fare_per_seat ?? 15
     }));
 
     res.json(transformed);
@@ -3305,7 +3343,7 @@ app.get('/api/client/bus-eta', async (req, res) => {
       .select(`
         id, bus_number, current_location,
         departure_status, scheduled_departure_time, actual_departure_time, departure_status_note,
-        route:routes(name, start_terminal_id, end_terminal_id)
+        route:routes(name, start_terminal_id, end_terminal_id, fare_per_seat)
       `)
       .eq('status', 'active');
  
