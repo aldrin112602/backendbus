@@ -1738,9 +1738,10 @@ app.put('/api/client/notification/:id/read', async (req, res) => {
 });
 
 // Mark all notifications as read for a user
-app.put('/api/client/notifications/read-all', async (req, res) => {
+// backend
+app.put('/api/client/notifications/:userId/read-all', async (req, res) => {
   try {
-    const { userId } = req.body;
+    const { userId } = req.params;
 
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
@@ -1748,10 +1749,7 @@ app.put('/api/client/notifications/read-all', async (req, res) => {
 
     const { data, error } = await supabase
       .from('notifications')
-      .update({ 
-        is_read: true, 
-        read_at: new Date().toISOString() 
-      })
+      .update({ is_read: true, read_at: new Date().toISOString() })
       .eq('recipient_id', userId)
       .eq('is_read', false)
       .select();
