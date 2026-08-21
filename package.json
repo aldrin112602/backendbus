@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "node src/server.js",
-    "build": "echo 'No build step required for plain JS'"
+    "build": "echo 'No build step required for plain JS'",
+    "cleanup-orphaned-auth-users": "node src/cleanup-orphaned-auth-users.js",
+    "cleanup-orphaned-auth-users-confirm": "node src/cleanup-orphaned-auth-users.js --confirm"
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.6",

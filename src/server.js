@@ -3886,7 +3886,6 @@ app.delete('/api/admin/user/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Ensure user exists
     const { data: user, error: userErr } = await supabase
       .from('users')
       .select('id, username, email, role')
@@ -3896,29 +3895,11 @@ app.delete('/api/admin/user/:id', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Detach bus role assignments if the user is a driver/conductor
-    await supabase
-      .from('buses')
-      .update({ driver_id: null })
-      .eq('driver_id', id);
-    await supabase
-      .from('buses')
-      .update({ conductor_id: null })
-      .eq('conductor_id', id);
+    await supabase.from('buses').update({ driver_id: null }).eq('driver_id', id);
+    await supabase.from('buses').update({ conductor_id: null }).eq('conductor_id', id);
+    await supabase.from('users').update({ created_by: null }).eq('created_by', id);
+    await supabase.from('notifications').delete().eq('recipient_id', id);
 
-    // Nullify created_by references to this user
-    await supabase
-      .from('users')
-      .update({ created_by: null })
-      .eq('created_by', id);
-
-    // Delete notifications for this user (safe to hard-delete)
-    await supabase
-      .from('notifications')
-      .delete()
-      .eq('recipient_id', id);
-
-    // Block deletion if there are dependent business records
     const [
       { count: bookingsCount },
       { count: feedbacksCount },
@@ -3941,12 +3922,21 @@ app.delete('/api/admin/user/:id', async (req, res) => {
       });
     }
 
-    // Finally, delete the user
-    const { error } = await supabase
-      .from('users')
-      .delete()
-      .eq('id', id);
+    const { error } = await supabase.from('users').delete().eq('id', id);
     if (error) throw error;
+
+    if (supabaseAdmin) {
+      const { error: authDeleteErr } = await supabaseAdmin.auth.admin.deleteUser(id);
+      if (authDeleteErr && !String(authDeleteErr.message || '').toLowerCase().includes('not found')) {
+        console.warn('Failed to delete auth user:', authDeleteErr.message);
+        return res.json({
+          message: `User ${user.username || user.email} deleted from database, but auth account cleanup failed`,
+          authWarning: authDeleteErr.message
+        });
+      }
+    } else {
+      console.warn('supabaseAdmin not configured — auth account not deleted, email may remain blocked for re-signup');
+    }
 
     res.json({ message: `User ${user.username || user.email} deleted successfully` });
   } catch (error) {
