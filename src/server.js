@@ -1223,7 +1223,6 @@ app.post('/api/client/feedback', async (req, res) => {
   }
 });
 
-// Get recent feedback (public/recent list)
 app.get('/api/client/feedback', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -1231,6 +1230,7 @@ app.get('/api/client/feedback', async (req, res) => {
       .from('feedbacks')
       .select(`
         id, rating, comment, created_at, user_id, bus_id,
+        user:user_id(username, email, profile),
         bus:bus_id(bus_number, route:route_id(name))
       `)
       .order('created_at', { ascending: false })
