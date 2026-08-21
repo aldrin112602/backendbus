@@ -3431,11 +3431,11 @@ app.get('/api/client/buses', async (req, res) => {
       .eq('status', 'active');
 
     if (error) throw error;
-    
-    const transformed = data.map(bus => ({
+
+    const transformed = data.map(({ route, ...bus }) => ({
       ...bus,
-      route_name: bus.route?.name,
-      fare_per_seat: bus.route?.fare_per_seat ?? 15
+      route_name: route?.name ?? null,
+      fare_per_seat: route?.fare_per_seat ?? 15
     }));
 
     res.json(transformed);
