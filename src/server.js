@@ -3894,47 +3894,28 @@ app.delete('/api/admin/user/:id', async (req, res) => {
     if (userErr || !user) {
       return res.status(404).json({ error: 'User not found' });
     }
-
     await supabase.from('users').update({ created_by: null }).eq('created_by', id);
     await supabase.from('buses').update({ driver_id: null }).eq('driver_id', id);
     await supabase.from('buses').update({ conductor_id: null }).eq('conductor_id', id);
     await supabase.from('bus_locations').update({ employee_id: null }).eq('employee_id', id);
     await supabase.from('bookings').update({ payment_confirmed_by: null }).eq('payment_confirmed_by', id);
     await supabase.from('discount_verifications').update({ verified_by: null }).eq('verified_by', id);
-    await supabase.from('notifications').delete().eq('recipient_id', id);
-    const [
-      { count: bookingsCount },
-      { count: feedbacksCount },
-      { count: reportsCount },
-      { count: discountVerificationsCount }
-    ] = await Promise.all([
-      supabase.from('bookings').select('*', { count: 'exact', head: true }).eq('user_id', id),
-      supabase.from('feedbacks').select('*', { count: 'exact', head: true }).eq('user_id', id),
-      supabase.from('reports').select('*', { count: 'exact', head: true }).eq('employee_id', id),
-      supabase.from('discount_verifications').select('*', { count: 'exact', head: true }).eq('user_id', id)
-    ]);
-
-    if (
-      (bookingsCount || 0) > 0 ||
-      (feedbacksCount || 0) > 0 ||
-      (reportsCount || 0) > 0 ||
-      (discountVerificationsCount || 0) > 0
-    ) {
-      return res.status(400).json({
-        error: 'Cannot delete user due to dependent records',
-        details: {
-          bookings: bookingsCount || 0,
-          feedbacks: feedbacksCount || 0,
-          reports: reportsCount || 0,
-          discount_verifications: discountVerificationsCount || 0
-        },
-        note: 'Cancel/delete dependent records first, or consider a soft delete (status=inactive)'
-      });
+    const { data: userBookings } = await supabase
+      .from('bookings')
+      .select('id')
+      .eq('user_id', id);
+    const bookingIds = (userBookings || []).map(b => b.id);
+    if (bookingIds.length > 0) {
+      await supabase.from('refund_requests').delete().in('booking_id', bookingIds);
     }
 
+    await supabase.from('bookings').delete().eq('user_id', id);
+    await supabase.from('feedbacks').delete().eq('user_id', id);
+    await supabase.from('reports').delete().eq('employee_id', id);
+    await supabase.from('discount_verifications').delete().eq('user_id', id);
+    await supabase.from('notifications').delete().eq('recipient_id', id);
     const { error } = await supabase.from('users').delete().eq('id', id);
     if (error) throw error;
-
     if (supabaseAdmin) {
       const { error: authDeleteErr } = await supabaseAdmin.auth.admin.deleteUser(id);
       if (authDeleteErr && !String(authDeleteErr.message || '').toLowerCase().includes('not found')) {
@@ -3948,7 +3929,7 @@ app.delete('/api/admin/user/:id', async (req, res) => {
       console.warn('supabaseAdmin not configured — auth account not deleted, email may remain blocked for re-signup');
     }
 
-    res.json({ message: `User ${user.username || user.email} deleted successfully` });
+    res.json({ message: `User ${user.username || user.email} and all related data deleted permanently` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
