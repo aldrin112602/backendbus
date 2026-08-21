@@ -1209,10 +1209,10 @@ app.get('/api/client/bookings', async (req, res) => {
 
 app.post('/api/client/feedback', async (req, res) => {
   try {
-    const { userId, busId, rating, comment } = req.body;
+    const { user_id, bus_id, rating, comment } = req.body;
     const { data: feedback, error } = await supabase
       .from('feedbacks')
-      .insert({ user_id: userId, bus_id: busId, rating, comment })
+      .insert({ user_id, bus_id, rating, comment })
       .select()
       .single();
 
