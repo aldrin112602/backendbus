@@ -1223,6 +1223,54 @@ app.post('/api/client/feedback', async (req, res) => {
   }
 });
 
+// Get recent feedback (public/recent list)
+app.get('/api/client/feedback', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    let query = supabase
+      .from('feedbacks')
+      .select(`
+        id, rating, comment, created_at, user_id, bus_id,
+        bus:bus_id(bus_number, route:route_id(name))
+      `)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/client/feedback/user', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('feedbacks')
+      .select(`
+        id, rating, comment, created_at, bus_id,
+        bus:bus_id(bus_number, route:route_id(name))
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Delete client's feedback
 app.delete('/api/client/feedback/:id', async (req, res) => {
   try {
