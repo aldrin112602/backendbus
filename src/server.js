@@ -636,6 +636,69 @@ const cleanupNotificationChannel = (userId) => {
   }
 };
 
+
+app.put('/api/employee/booking/:id/mark-paid', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { employeeId } = req.body || {};
+
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+
+    const { data: booking, error: bookingErr } = await supabase
+      .from('bookings')
+      .select('id, bus_id, payment_method, payment_status, status')
+      .eq('id', id)
+      .single();
+
+    if (bookingErr || !booking) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    if (booking.payment_method !== 'cash') {
+      return res.status(400).json({ error: 'Only cash bookings can be marked paid this way' });
+    }
+
+    if (booking.payment_status === 'paid') {
+      return res.json({ message: 'Already marked as paid', booking });
+    }
+    const { data: bus, error: busErr } = await supabase
+      .from('buses')
+      .select('id, driver_id, conductor_id')
+      .eq('id', booking.bus_id)
+      .single();
+
+    if (busErr || !bus) {
+      return res.status(404).json({ error: 'Bus not found for this booking' });
+    }
+
+    const isAssigned = bus.driver_id === employeeId || bus.conductor_id === employeeId;
+    if (!isAssigned) {
+      return res.status(403).json({ error: 'You are not assigned to this bus' });
+    }
+    const { data: updated, error: updateErr } = await supabase
+      .from('bookings')
+      .update({
+        payment_status: 'paid',
+        payment_confirmed_by: employeeId,
+        payment_confirmed_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateErr) throw updateErr;
+
+    res.json({ message: 'Marked as paid', booking: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
 // Server-Sent Events (SSE) endpoint for real-time notifications per user
 app.get('/api/rt/notifications/:userId', (req, res) => {
   const { userId } = req.params;
