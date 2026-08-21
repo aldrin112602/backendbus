@@ -3895,28 +3895,38 @@ app.delete('/api/admin/user/:id', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    await supabase.from('users').update({ created_by: null }).eq('created_by', id);
     await supabase.from('buses').update({ driver_id: null }).eq('driver_id', id);
     await supabase.from('buses').update({ conductor_id: null }).eq('conductor_id', id);
-    await supabase.from('users').update({ created_by: null }).eq('created_by', id);
+    await supabase.from('bus_locations').update({ employee_id: null }).eq('employee_id', id);
+    await supabase.from('bookings').update({ payment_confirmed_by: null }).eq('payment_confirmed_by', id);
+    await supabase.from('discount_verifications').update({ verified_by: null }).eq('verified_by', id);
     await supabase.from('notifications').delete().eq('recipient_id', id);
-
     const [
       { count: bookingsCount },
       { count: feedbacksCount },
-      { count: reportsCount }
+      { count: reportsCount },
+      { count: discountVerificationsCount }
     ] = await Promise.all([
       supabase.from('bookings').select('*', { count: 'exact', head: true }).eq('user_id', id),
       supabase.from('feedbacks').select('*', { count: 'exact', head: true }).eq('user_id', id),
-      supabase.from('reports').select('*', { count: 'exact', head: true }).eq('employee_id', id)
+      supabase.from('reports').select('*', { count: 'exact', head: true }).eq('employee_id', id),
+      supabase.from('discount_verifications').select('*', { count: 'exact', head: true }).eq('user_id', id)
     ]);
 
-    if ((bookingsCount || 0) > 0 || (feedbacksCount || 0) > 0 || (reportsCount || 0) > 0) {
+    if (
+      (bookingsCount || 0) > 0 ||
+      (feedbacksCount || 0) > 0 ||
+      (reportsCount || 0) > 0 ||
+      (discountVerificationsCount || 0) > 0
+    ) {
       return res.status(400).json({
         error: 'Cannot delete user due to dependent records',
         details: {
           bookings: bookingsCount || 0,
           feedbacks: feedbacksCount || 0,
-          reports: reportsCount || 0
+          reports: reportsCount || 0,
+          discount_verifications: discountVerificationsCount || 0
         },
         note: 'Cancel/delete dependent records first, or consider a soft delete (status=inactive)'
       });
