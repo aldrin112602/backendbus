@@ -80,7 +80,7 @@ function getBearerToken(req) {
 // Middleware
 app.use(cors());
 app.use((req, res, next) => {
-  if (req.originalUrl === '/webhook') return next();
+  if (req.originalUrl === '/webhook' || req.originalUrl === '/api/webhook') return next();
   return express.json({ limit: '10mb' })(req, res, next);
 });
 
