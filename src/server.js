@@ -71,11 +71,8 @@ const passwordOtpStore = new Map();
 const latestLocationsByBusId = new Map();
 const liveLocationClients = new Set();
 
-// Returns the subset of `seatList` that are already taken by another
-// non-cancelled booking for the same bus + travel date.
-// This is the check that was missing: previously only a numeric
-// `available_seats` counter was decremented, so two different accounts
-// could both successfully book the exact same seat number.
+const seatReadClient = supabaseAdmin || supabase;
+
 async function findSeatConflicts(busId, travelDate, seatList) {
   if (!busId || !travelDate || !Array.isArray(seatList) || seatList.length === 0) {
     return [];
@@ -83,9 +80,7 @@ async function findSeatConflicts(busId, travelDate, seatList) {
 
   const day = new Date(travelDate);
   if (Number.isNaN(day.getTime())) {
-    // If we can't parse the date, fall back to an exact string match
-    // instead of silently skipping the check.
-    const { data, error } = await supabase
+    const { data, error } = await seatReadClient
       .from('bookings')
       .select('seats')
       .eq('bus_id', busId)
@@ -102,7 +97,7 @@ async function findSeatConflicts(busId, travelDate, seatList) {
   const dayEnd = new Date(dayStart);
   dayEnd.setDate(dayEnd.getDate() + 1);
 
-  const { data, error } = await supabase
+  const { data, error } = await seatReadClient
     .from('bookings')
     .select('seats')
     .eq('bus_id', busId)
@@ -152,9 +147,13 @@ app.get(['/health', '/api/health'], (req, res) => {
   });
 });
 
-// Helper: send simple receipt email via SendGrid (if configured)
-// Create a Stripe checkout session
 app.post('/api/create-payment-session', async (req, res) => {
+  return res.status(410).json({
+    error: 'This endpoint is deprecated. Use /api/client/create-payment-session instead.',
+  });
+});
+
+app.post('/__disabled/api/create-payment-session', async (req, res) => {
   if (!stripe) {
     return res.status(500).json({ error: 'Stripe is not configured' });
   }
@@ -809,7 +808,7 @@ app.get('/api/buses/:busId/booked-seats', async (req, res) => {
     const dayEnd = new Date(dayStart);
     dayEnd.setDate(dayEnd.getDate() + 1);
 
-    const { data, error } = await supabase
+    const { data, error } = await seatReadClient
       .from('bookings')
       .select('seats')
       .eq('bus_id', busId)
