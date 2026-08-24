@@ -71,6 +71,52 @@ const passwordOtpStore = new Map();
 const latestLocationsByBusId = new Map();
 const liveLocationClients = new Set();
 
+// Returns the subset of `seatList` that are already taken by another
+// non-cancelled booking for the same bus + travel date.
+// This is the check that was missing: previously only a numeric
+// `available_seats` counter was decremented, so two different accounts
+// could both successfully book the exact same seat number.
+async function findSeatConflicts(busId, travelDate, seatList) {
+  if (!busId || !travelDate || !Array.isArray(seatList) || seatList.length === 0) {
+    return [];
+  }
+
+  const day = new Date(travelDate);
+  if (Number.isNaN(day.getTime())) {
+    // If we can't parse the date, fall back to an exact string match
+    // instead of silently skipping the check.
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('seats')
+      .eq('bus_id', busId)
+      .eq('travel_date', travelDate)
+      .neq('status', 'cancelled');
+    if (error) throw error;
+    const taken = new Set();
+    (data || []).forEach((b) => (b.seats || []).forEach((s) => taken.add(String(s))));
+    return seatList.filter((s) => taken.has(String(s)));
+  }
+
+  const dayStart = new Date(day);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
+
+  const { data, error } = await supabase
+    .from('bookings')
+    .select('seats')
+    .eq('bus_id', busId)
+    .neq('status', 'cancelled')
+    .gte('travel_date', dayStart.toISOString())
+    .lt('travel_date', dayEnd.toISOString());
+
+  if (error) throw error;
+
+  const taken = new Set();
+  (data || []).forEach((b) => (b.seats || []).forEach((s) => taken.add(String(s))));
+  return seatList.filter((s) => taken.has(String(s)));
+}
+
 function getBearerToken(req) {
   const header = req.headers.authorization || '';
   const match = header.match(/^Bearer\s+(.+)$/i);
@@ -745,6 +791,44 @@ app.get('/api/rt/notifications/:userId', (req, res) => {
   });
 });
 
+
+app.get('/api/buses/:busId/booked-seats', async (req, res) => {
+  try {
+    const { busId } = req.params;
+    const { date } = req.query;
+    if (!busId || !date) {
+      return res.status(400).json({ error: 'busId and date are required' });
+    }
+
+    const day = new Date(date);
+    if (Number.isNaN(day.getTime())) {
+      return res.status(400).json({ error: 'Invalid date' });
+    }
+    const dayStart = new Date(day);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart);
+    dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('seats')
+      .eq('bus_id', busId)
+      .neq('status', 'cancelled')
+      .gte('travel_date', dayStart.toISOString())
+      .lt('travel_date', dayEnd.toISOString());
+
+    if (error) throw error;
+
+    const takenSeats = Array.from(
+      new Set((data || []).flatMap((b) => (b.seats || []).map((s) => Number(s))))
+    ).sort((a, b) => a - b);
+
+    res.json({ bookedSeats: takenSeats });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/client/booking', async (req, res) => {
   try {
     const {
@@ -819,6 +903,16 @@ app.post('/api/client/booking', async (req, res) => {
 
     const farePerSeat = Number(busForFare.route?.fare_per_seat ?? 15);
     const resolvedAmount = Number((farePerSeat * seatList.length * discountMultiplier).toFixed(2));
+
+    // Prevent double-booking: reject if any requested seat is already
+    // held by another non-cancelled booking for this bus + date.
+    const seatConflicts = await findSeatConflicts(busId, travelDate, seatList);
+    if (seatConflicts.length > 0) {
+      return res.status(409).json({
+        error: `Seat(s) already taken: ${seatConflicts.join(', ')}. Please choose different seat(s).`,
+        conflictingSeats: seatConflicts,
+      });
+    }
 
     const pickupPayload =
       pickup_lat != null &&
@@ -983,6 +1077,15 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     // Calculate amount with discount
     const seatCount = (seats && seats.length) || 1;
     const finalAmount = Number((farePerSeat * seatCount * discountMultiplier).toFixed(2));
+
+    // Prevent double-booking, same as the cash-payment endpoint.
+    const seatConflicts = await findSeatConflicts(busId, date, seats || []);
+    if (seatConflicts.length > 0) {
+      return res.status(409).json({
+        error: `Seat(s) already taken: ${seatConflicts.join(', ')}. Please choose different seat(s).`,
+        conflictingSeats: seatConflicts,
+      });
+    }
 
     // Create booking with pending payment
     const bookingPayload = {
