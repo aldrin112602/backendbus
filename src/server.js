@@ -2381,6 +2381,76 @@ app.delete('/api/employee/notification/:id', async (req, res) => {
   }
 });
 
+
+app.post('/api/employee/notification/broadcast', async (req, res) => {
+  try {
+    const { employeeId, busId, type, message, title } = req.body;
+
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+    if (!busId) {
+      return res.status(400).json({ error: 'Bus ID is required' });
+    }
+    if (!type || !message) {
+      return res.status(400).json({ error: 'type and message are required' });
+    }
+
+    const allowedTypes = ['delay', 'route_change', 'traffic', 'general', 'announcement', 'maintenance'];
+    if (!allowedTypes.includes(type)) {
+      return res.status(400).json({
+        error: 'Invalid notification type',
+        allowedTypes
+      });
+    }
+
+
+    const { data: bookings, error: bookingsError } = await supabase
+      .from('bookings')
+      .select('user_id, status')
+      .eq('bus_id', busId)
+      .neq('status', 'cancelled');
+
+    if (bookingsError) throw bookingsError;
+
+    const passengerIds = [...new Set((bookings || [])
+      .map(b => b.user_id)
+      .filter(Boolean))];
+
+    if (passengerIds.length === 0) {
+      return res.status(404).json({ error: 'No active passengers found for this bus' });
+    }
+
+    const notifications = passengerIds.map(recipient_id => ({
+      recipient_id,
+      type,
+      message,
+      title: title || null,
+      is_read: false,
+      priority: type === 'maintenance' || type === 'delay' ? 'high' : 'normal'
+    }));
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .insert(notifications)
+      .select();
+
+    if (error) throw error;
+
+    passengerIds.forEach(recipient_id => {
+      createNotificationChannel(recipient_id);
+    });
+
+    res.status(201).json({
+      message: `Notification sent to ${passengerIds.length} passenger(s) on this bus`,
+      count: passengerIds.length,
+      notifications: data
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Utility Endpoints ---
 
 // Test endpoint to verify routing
