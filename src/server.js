@@ -2381,7 +2381,6 @@ app.delete('/api/employee/notification/:id', async (req, res) => {
   }
 });
 
-
 app.post('/api/employee/notification/broadcast', async (req, res) => {
   try {
     const { employeeId, busId, type, message, title } = req.body;
@@ -2396,6 +2395,7 @@ app.post('/api/employee/notification/broadcast', async (req, res) => {
       return res.status(400).json({ error: 'type and message are required' });
     }
 
+    // Validate notification type against allowed values
     const allowedTypes = ['delay', 'route_change', 'traffic', 'general', 'announcement', 'maintenance'];
     if (!allowedTypes.includes(type)) {
       return res.status(400).json({
@@ -2404,7 +2404,7 @@ app.post('/api/employee/notification/broadcast', async (req, res) => {
       });
     }
 
-
+    // Passengers of THIS bus only = distinct user_ids from active bookings on busId
     const { data: bookings, error: bookingsError } = await supabase
       .from('bookings')
       .select('user_id, status')
@@ -2437,6 +2437,7 @@ app.post('/api/employee/notification/broadcast', async (req, res) => {
 
     if (error) throw error;
 
+    // Push over real-time channels
     passengerIds.forEach(recipient_id => {
       createNotificationChannel(recipient_id);
     });
@@ -3753,11 +3754,11 @@ app.post('/api/auth/signup', async (req, res) => {
     });
 
     if (error) throw error;
-
-    // Insert additional user data
-    await supabase
+    const { error: profileError } = await supabase
       .from('users')
-      .insert({ id: data.user.id, username, email, role, profile });
+      .upsert({ id: data.user.id, username, email, role, profile }, { onConflict: 'id' });
+
+    if (profileError) throw profileError;
 
     res.status(201).json(data);
   } catch (error) {
@@ -4251,9 +4252,15 @@ app.post('/api/admin/employee/create', async (req, res) => {
     const newUserId = authAdminData.user && authAdminData.user.id ? authAdminData.user.id : null;
     if (!newUserId) return res.status(500).json({ error: 'Failed to create auth user' });
 
+    // NOTE: creating the auth user above fires the `on_auth_user_created` DB trigger,
+    // which auto-inserts a row into public.users with role='client' (id = newUserId).
+    // We must UPSERT here (not plain insert) or this call fails with a duplicate-key
+    // error on users_pkey, which the catch block below then mis-reports as
+    // "email already exists" — and the trigger's role='client' row is left in place
+    // instead of the intended role.
     const { data: userData, error: userError } = await supabaseAdmin
       .from('users')
-      .insert({
+      .upsert({
         id: newUserId,
         username: email.split('@')[0],
         email,
@@ -4267,7 +4274,7 @@ app.post('/api/admin/employee/create', async (req, res) => {
           created_date: new Date().toISOString()
         },
         status: 'pending'
-      })
+      }, { onConflict: 'id' })
       .select()
       .single();
     if (userError) throw userError;
