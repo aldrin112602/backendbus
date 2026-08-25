@@ -1876,7 +1876,10 @@ app.get('/api/client/notifications', async (req, res) => {
 
     let query = supabase
       .from('notifications')
-      .select('*')
+      .select(`
+        *,
+        bus:bus_id(bus_number, route:route_id(name))
+      `)
       .eq('recipient_id', userId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
@@ -2274,7 +2277,10 @@ app.get('/api/employee/notifications', async (req, res) => {
 
     let query = supabase
       .from('notifications')
-      .select('*')
+      .select(`
+        *,
+        bus:bus_id(bus_number, route:route_id(name))
+      `)
       .eq('recipient_id', employeeId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
@@ -2381,6 +2387,7 @@ app.delete('/api/employee/notification/:id', async (req, res) => {
   }
 });
 
+// Employee: send a notification to all passengers currently booked on their bus
 app.post('/api/employee/notification/broadcast', async (req, res) => {
   try {
     const { employeeId, busId, type, message, title } = req.body;
@@ -2423,6 +2430,7 @@ app.post('/api/employee/notification/broadcast', async (req, res) => {
 
     const notifications = passengerIds.map(recipient_id => ({
       recipient_id,
+      bus_id: busId,
       type,
       message,
       title: title || null,
@@ -2433,7 +2441,10 @@ app.post('/api/employee/notification/broadcast', async (req, res) => {
     const { data, error } = await supabase
       .from('notifications')
       .insert(notifications)
-      .select();
+      .select(`
+        *,
+        bus:bus_id(bus_number, route:route_id(name))
+      `);
 
     if (error) throw error;
 
@@ -3754,6 +3765,7 @@ app.post('/api/auth/signup', async (req, res) => {
     });
 
     if (error) throw error;
+
     const { error: profileError } = await supabase
       .from('users')
       .upsert({ id: data.user.id, username, email, role, profile }, { onConflict: 'id' });
