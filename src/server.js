@@ -73,6 +73,19 @@ const liveLocationClients = new Set();
 
 const seatReadClient = supabaseAdmin || supabase;
 
+async function expireStaleBookings() {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const { error } = await supabase
+    .from('bookings')
+    .update({ status: 'no_show' })
+    .in('status', ['pending', 'confirmed'])
+    .lt('travel_date', todayStart.toISOString());
+
+  if (error) console.warn('Could not expire stale bookings:', error.message);
+}
+
 async function findSeatConflicts(busId, travelDate, seatList) {
   if (!busId || !travelDate || !Array.isArray(seatList) || seatList.length === 0) {
     return [];
@@ -741,6 +754,55 @@ app.put('/api/employee/booking/:id/mark-paid', async (req, res) => {
   }
 });
 
+app.put('/api/employee/booking/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { employeeId, status } = req.body || {};
+    const allowedStatuses = ['boarded', 'completed', 'no_show'];
+
+    if (!employeeId || !allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Employee ID and a valid booking status are required' });
+    }
+
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .select('id, bus_id, status')
+      .eq('id', id)
+      .single();
+    if (bookingError || !booking) return res.status(404).json({ error: 'Booking not found' });
+
+    const { data: bus, error: busError } = await supabase
+      .from('buses')
+      .select('id, driver_id, conductor_id')
+      .eq('id', booking.bus_id)
+      .single();
+    if (busError || !bus) return res.status(404).json({ error: 'Bus not found for this booking' });
+    if (bus.driver_id !== employeeId && bus.conductor_id !== employeeId) {
+      return res.status(403).json({ error: 'You are not assigned to this bus' });
+    }
+
+    const validTransition =
+      (status === 'boarded' && ['pending', 'confirmed'].includes(booking.status)) ||
+      (status === 'completed' && booking.status === 'boarded') ||
+      (status === 'no_show' && ['pending', 'confirmed'].includes(booking.status));
+    if (!validTransition) {
+      return res.status(409).json({ error: `Cannot change booking from ${booking.status} to ${status}` });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('bookings')
+      .update({ status })
+      .eq('id', id)
+      .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
+      .single();
+    if (updateError) throw updateError;
+
+    res.json({ message: `Booking marked ${status}`, booking: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 
 
@@ -1288,6 +1350,7 @@ app.delete('/api/client/booking/:id', async (req, res) => {
 
 app.get('/api/client/bookings', async (req, res) => {
   try {
+    await expireStaleBookings();
     const { userId } = req.query;
     let query = supabase
       .from('bookings')
@@ -3852,6 +3915,15 @@ app.put('/api/employee/bus-status/:busId', async (req, res) => {
       .single();
 
     if (updateError) throw updateError;
+
+    if (status === 'arrived') {
+      const { error: completionError } = await supabase
+        .from('bookings')
+        .update({ status: 'completed' })
+        .eq('bus_id', busId)
+        .eq('status', 'boarded');
+      if (completionError) console.warn('Could not complete boarded bookings:', completionError.message);
+    }
 
     res.json(updatedBus);
   } catch (error) {
