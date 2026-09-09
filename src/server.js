@@ -4855,13 +4855,13 @@ app.get('/api/employee/bookings', async (req, res) => {
 
 app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
   try {
-    const { employeeId, seat_assignment } = req.body || {};
+    const { employeeId, seat_assignment, seat_number } = req.body || {};
     if (!employeeId || !['seat', 'standing'].includes(seat_assignment)) {
       return res.status(400).json({ error: 'employeeId and seat_assignment (seat or standing) are required' });
     }
     const { data: booking, error: bookingError } = await supabase
       .from('bookings')
-      .select('id, bus_id, status, booking_type')
+      .select('id, bus_id, status, booking_type, seat_assignment, travel_date, seats')
       .eq('id', req.params.id)
       .single();
     if (bookingError || !booking) return res.status(404).json({ error: 'Pickup request not found' });
@@ -4874,12 +4874,29 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
       return res.status(403).json({ error: 'You are not assigned to this bus' });
     }
     if (seat_assignment === 'seat') {
+      const seatNumber = Number(seat_number);
+      if (!Number.isInteger(seatNumber) || seatNumber < 1) {
+        return res.status(400).json({ error: 'Choose a valid seat number' });
+      }
       const bus = await syncBusAvailability(booking.bus_id);
-      if (bus.available_seats < 1) return res.status(409).json({ error: 'No seats available; assign standing instead' });
+      if (booking.seat_assignment !== 'seat' && bus.available_seats < 1) {
+        return res.status(409).json({ error: 'No seats available; assign standing instead' });
+      }
+      if (seatNumber > Number(bus.total_seats || 0)) {
+        return res.status(400).json({ error: 'Seat number is outside this bus capacity' });
+      }
+      const conflicts = await findSeatConflicts(booking.bus_id, booking.travel_date, [seatNumber]);
+      const alreadyAssignedHere = Array.isArray(booking.seats) && booking.seats.some((seat) => Number(seat) === seatNumber);
+      if (conflicts.length > 0 && !alreadyAssignedHere) {
+        return res.status(409).json({ error: `Seat ${seatNumber} is already assigned` });
+      }
     }
     const { data: updated, error: updateError } = await supabase
       .from('bookings')
-      .update({ seat_assignment })
+      .update({
+        seat_assignment,
+        ...(seat_assignment === 'seat' ? { seats: [Number(seat_number)] } : { seats: [] }),
+      })
       .eq('id', req.params.id)
       .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
       .single();
