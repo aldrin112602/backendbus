@@ -3840,6 +3840,9 @@ app.post('/api/admin/trips', async (req, res) => {
 app.put('/api/admin/trips/:id', async (req, res) => {
   try {
     const { status, departure_time, status_note } = req.body || {};
+    if (status !== undefined) {
+      return res.status(403).json({ error: 'Trip dispatch status is updated by the assigned employee, not admin.' });
+    }
     const allowed = ['scheduled', 'boarding', 'departed', 'arrived', 'cancelled'];
     if (status !== undefined && !allowed.includes(status)) return res.status(400).json({ error: 'Invalid trip status' });
     if (departure_time !== undefined && Number.isNaN(new Date(departure_time).getTime())) return res.status(400).json({ error: 'Invalid departure_time' });
@@ -3893,15 +3896,26 @@ app.get('/api/client/buses', async (req, res) => {
     // Old deployments can keep working until the migration is applied.
     if (tripsError && !String(tripsError.message || '').includes('bus_trips')) throw tripsError;
     const tripsByBus = new Map();
+    const nextTripByRoute = new Map();
     (trips || []).forEach((trip) => {
       const current = tripsByBus.get(trip.bus_id)?.current_trip;
       const next = tripsByBus.get(trip.bus_id)?.next_trip;
       const isCurrent = ['boarding', 'departed'].includes(trip.status);
-      const isNext = ['scheduled', 'boarding'].includes(trip.status) && new Date(trip.departure_time) >= now;
+      // A boarding trip may be past its scheduled time; it is still the next
+      // bookable bus and must not disappear from the client queue.
+      const isNext = ['scheduled', 'boarding'].includes(trip.status);
       tripsByBus.set(trip.bus_id, {
         current_trip: isCurrent ? trip : current,
         next_trip: isNext && !next ? trip : next,
       });
+      if (isNext && trip.route_id) {
+        const existing = nextTripByRoute.get(trip.route_id);
+        const priority = trip.status === 'boarding' ? 0 : 1;
+        const existingPriority = existing?.status === 'boarding' ? 0 : 1;
+        if (!existing || priority < existingPriority || (priority === existingPriority && new Date(trip.departure_time) < new Date(existing.departure_time))) {
+          nextTripByRoute.set(trip.route_id, trip);
+        }
+      }
     });
 
     const transformed = data.map(({ route, ...bus }) => ({
@@ -3909,6 +3923,7 @@ app.get('/api/client/buses', async (req, res) => {
       route_name: route?.name ?? null,
       fare_per_seat: route?.fare_per_seat ?? 15,
       ...(tripsByBus.get(bus.id) || {}),
+      next_route_trip: nextTripByRoute.get(bus.route_id) || null,
     }));
 
     res.json(transformed);
@@ -4126,7 +4141,7 @@ app.put('/api/employee/bus-status/:busId', async (req, res) => {
       status_note, 
     } = req.body || {};
 
-    const allowedStatuses = ['scheduled', 'departed', 'delayed', 'arrived', 'cancelled'];
+    const allowedStatuses = ['scheduled', 'boarding', 'departed', 'delayed', 'arrived', 'cancelled'];
     if (!status || !allowedStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid or missing status', allowedStatuses });
     }
