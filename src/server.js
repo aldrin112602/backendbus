@@ -9,6 +9,31 @@ const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 
 const app = express();
 
+
+// Calculate a rough ETA from live GPS position to the route's end terminal.
+// Returns null when reliable live GPS/speed/destination data is unavailable.
+function calculateBusEta(currentLocation, targetLocation, speedMetersPerSecond) {
+  if (!currentLocation || !targetLocation) return null;
+  if (typeof speedMetersPerSecond !== 'number' || !Number.isFinite(speedMetersPerSecond) || speedMetersPerSecond <= 0.5) {
+    return null;
+  }
+
+  const toRadians = (degrees) => (degrees * Math.PI) / 180;
+  const earthRadiusMeters = 6371000;
+  const dLat = toRadians(targetLocation.lat - currentLocation.lat);
+  const dLng = toRadians(targetLocation.lng - currentLocation.lng);
+  const lat1 = toRadians(currentLocation.lat);
+  const lat2 = toRadians(targetLocation.lat);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  const distanceMeters = 2 * earthRadiusMeters * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  const minutes = Math.max(1, Math.round(distanceMeters / speedMetersPerSecond / 60));
+  return `${minutes} mins`;
+}
+
 function normalizeLatLng(value) {
   if (value == null) return null;
   let loc = value;
@@ -3704,26 +3729,62 @@ app.get('/api/client/bus-eta', async (req, res) => {
       .eq('status', 'active');
  
     if (error) throw error;
- 
+
+    const terminalIds = Array.from(new Set(
+      buses.flatMap(bus => [bus.route?.end_terminal_id].filter(Boolean))
+    ));
+
+    let terminalMap = new Map();
+    if (terminalIds.length > 0) {
+      const { data: terminals, error: terminalError } = await supabase
+        .from('terminals')
+        .select('id, lat, lng')
+        .in('id', terminalIds);
+
+      if (terminalError) throw terminalError;
+      terminalMap = new Map((terminals || []).map(terminal => [terminal.id, terminal]));
+    }
+
+    const now = Date.now();
+    const LIVE_LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
+
     const etas = buses.map(bus => {
       const tracked = latestLocationsByBusId.get(bus.id);
-      const currentLocation =
-        normalizeLatLng(tracked) || normalizeLatLng(bus.current_location);
- 
+      const trackedLocation = normalizeLatLng(tracked);
+      const databaseLocation = normalizeLatLng(bus.current_location);
+      const currentLocation = trackedLocation || databaseLocation;
+
+      const trackedTimestamp = tracked?.timestamp ? Date.parse(tracked.timestamp) : NaN;
+      const hasRecentLiveLocation =
+        Boolean(trackedLocation) &&
+        Number.isFinite(trackedTimestamp) &&
+        now - trackedTimestamp <= LIVE_LOCATION_MAX_AGE_MS;
+
+      const destination = bus.route?.end_terminal_id
+        ? normalizeLatLng(terminalMap.get(bus.route.end_terminal_id))
+        : null;
+
+      const eta = hasRecentLiveLocation
+        ? calculateBusEta(trackedLocation, destination, tracked?.speed)
+        : null;
+
       return {
         busId: bus.id,
         busNumber: bus.bus_number,
-        eta: '15 mins',
+        eta,
         currentLocation,
-        route: bus.route,
-        locationSource: tracked ? 'employee_live' : currentLocation ? 'database' : null,
+        locationSource: hasRecentLiveLocation
+          ? 'employee_live'
+          : databaseLocation
+            ? 'database'
+            : null,
         departureStatus: bus.departure_status || null,
         scheduledDepartureTime: bus.scheduled_departure_time || null,
         actualDepartureTime: bus.actual_departure_time || null,
         departureStatusNote: bus.departure_status_note || null,
       };
     });
- 
+
     res.json(etas);
   } catch (error) {
     res.status(500).json({ error: error.message });
