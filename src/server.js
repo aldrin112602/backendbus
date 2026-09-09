@@ -4891,6 +4891,42 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
   }
 });
 
+// Pickup requests have no predefined route fare. The assigned crew records the
+// fare after assessing the passenger's actual pickup point.
+app.put('/api/employee/booking/:id/fare', async (req, res) => {
+  try {
+    const { employeeId, amount } = req.body || {};
+    const fare = Number(amount);
+    if (!employeeId || !Number.isFinite(fare) || fare < 0) {
+      return res.status(400).json({ error: 'employeeId and a non-negative fare amount are required' });
+    }
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .select('id, bus_id, booking_type, status')
+      .eq('id', req.params.id)
+      .single();
+    if (bookingError || !booking) return res.status(404).json({ error: 'Pickup request not found' });
+    if (booking.booking_type !== 'pickup_request' || !['pending', 'confirmed', 'boarded'].includes(booking.status)) {
+      return res.status(409).json({ error: 'Fare can only be set for an active pickup request' });
+    }
+    const { data: employee, error: employeeError } = await supabase
+      .from('users').select('assigned_bus_id').eq('id', employeeId).single();
+    if (employeeError || employee?.assigned_bus_id !== booking.bus_id) {
+      return res.status(403).json({ error: 'You are not assigned to this bus' });
+    }
+    const { data: updated, error: updateError } = await supabase
+      .from('bookings')
+      .update({ amount: Number(fare.toFixed(2)) })
+      .eq('id', req.params.id)
+      .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
+      .single();
+    if (updateError) throw updateError;
+    res.json({ booking: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // “Pick Up Me” is intentionally not a booking: it has no fare and reserves
 // no capacity until the assigned crew chooses a seat or standing status.
 app.post('/api/client/pickup-request', async (req, res) => {
