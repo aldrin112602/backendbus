@@ -4155,7 +4155,9 @@ app.put('/api/employee/bus-status/:busId', async (req, res) => {
     }
 
     const updatePayload = {
-      departure_status: status,
+      // `boarding` is a trip-only status. Keep older bus-column constraints
+      // compatible while returning the real trip status to the employee app.
+      departure_status: status === 'boarding' ? 'scheduled' : status,
       scheduled_departure_time: scheduled_departure_time || null,
       actual_departure_time: actual_departure_time || null,
       departure_status_note: status_note || null,
@@ -4196,6 +4198,8 @@ app.put('/api/employee/bus-status/:busId', async (req, res) => {
         actual_arrival_time: status === 'arrived' ? new Date().toISOString() : undefined,
         updated_at: new Date().toISOString(),
       }).eq('id', activeTrip.id);
+      updatedBus.departure_status = status;
+      updatedBus.scheduled_departure_time = scheduled_departure_time || activeTrip.departure_time;
     }
 
     if (status === 'arrived') {
@@ -4811,8 +4815,21 @@ app.get('/api/employee/my-bus', async (req, res) => {
       ? latestLocationsByBusId.get(employee.assigned_bus_id)
       : null;
 
+    const { data: activeTrips } = await supabase.from('bus_trips')
+      .select('status, departure_time, actual_departure_time, status_note')
+      .eq('bus_id', employee.assigned_bus_id)
+      .in('status', ['scheduled', 'boarding', 'departed'])
+      .order('departure_time', { ascending: true });
+    const activeTrip = (activeTrips || []).find((trip) => ['boarding', 'departed'].includes(trip.status)) || activeTrips?.[0] || null;
+
     const bus = employee.bus ? {
       ...employee.bus,
+      ...(activeTrip ? {
+        departure_status: activeTrip.status,
+        scheduled_departure_time: activeTrip.departure_time,
+        actual_departure_time: activeTrip.actual_departure_time || null,
+        departure_status_note: activeTrip.status_note || null,
+      } : {}),
       current_location: normalizeLatLng(liveLocation) || employee.bus.current_location,
       route: route ? {
         ...route,
