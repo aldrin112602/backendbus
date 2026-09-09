@@ -119,7 +119,9 @@ async function syncBusAvailability(busId) {
   const occupied = (bookings || []).reduce((count, booking) => {
     const type = booking.booking_type || 'regular';
     if (type === 'pickup_request') {
-      return count + (booking.seat_assignment === 'seat' ? 1 : 0);
+      return count + (booking.seat_assignment === 'seat' && Array.isArray(booking.seats)
+        ? booking.seats.length
+        : 0);
     }
     return count + (Array.isArray(booking.seats) ? booking.seats.length : 0);
   }, 0);
@@ -4855,7 +4857,7 @@ app.get('/api/employee/bookings', async (req, res) => {
 
 app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
   try {
-    const { employeeId, seat_assignment, seat_number } = req.body || {};
+    const { employeeId, seat_assignment, seat_number, seat_numbers } = req.body || {};
     if (!employeeId || !['seat', 'standing'].includes(seat_assignment)) {
       return res.status(400).json({ error: 'employeeId and seat_assignment (seat or standing) are required' });
     }
@@ -4873,29 +4875,36 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
     if (employeeError || employee?.assigned_bus_id !== booking.bus_id) {
       return res.status(403).json({ error: 'You are not assigned to this bus' });
     }
+    let resolvedSeatNumbers = [];
     if (seat_assignment === 'seat') {
-      const seatNumber = Number(seat_number);
-      if (!Number.isInteger(seatNumber) || seatNumber < 1) {
-        return res.status(400).json({ error: 'Choose a valid seat number' });
+      const requestedSeats = Array.isArray(seat_numbers) && seat_numbers.length > 0
+        ? seat_numbers.map(Number)
+        : [Number(seat_number)];
+      const uniqueSeats = [...new Set(requestedSeats)];
+      if (uniqueSeats.length === 0 || uniqueSeats.some((seat) => !Number.isInteger(seat) || seat < 1)) {
+        return res.status(400).json({ error: 'Choose one or more valid seat numbers' });
       }
       const bus = await syncBusAvailability(booking.bus_id);
-      if (booking.seat_assignment !== 'seat' && bus.available_seats < 1) {
+      if (uniqueSeats.some((seat) => seat > Number(bus.total_seats || 0))) {
+        return res.status(400).json({ error: 'One or more seat numbers are outside this bus capacity' });
+      }
+      const existingSeats = Array.isArray(booking.seats) ? booking.seats.map(Number) : [];
+      const seatDelta = uniqueSeats.length - existingSeats.length;
+      if (seatDelta > 0 && bus.available_seats < seatDelta) {
         return res.status(409).json({ error: 'No seats available; assign standing instead' });
       }
-      if (seatNumber > Number(bus.total_seats || 0)) {
-        return res.status(400).json({ error: 'Seat number is outside this bus capacity' });
+      const conflicts = await findSeatConflicts(booking.bus_id, booking.travel_date, uniqueSeats);
+      const unavailableSeats = conflicts.filter((seat) => !existingSeats.includes(Number(seat)));
+      if (unavailableSeats.length > 0) {
+        return res.status(409).json({ error: `Seat(s) already assigned: ${unavailableSeats.join(', ')}` });
       }
-      const conflicts = await findSeatConflicts(booking.bus_id, booking.travel_date, [seatNumber]);
-      const alreadyAssignedHere = Array.isArray(booking.seats) && booking.seats.some((seat) => Number(seat) === seatNumber);
-      if (conflicts.length > 0 && !alreadyAssignedHere) {
-        return res.status(409).json({ error: `Seat ${seatNumber} is already assigned` });
-      }
+      resolvedSeatNumbers = uniqueSeats;
     }
     const { data: updated, error: updateError } = await supabase
       .from('bookings')
       .update({
         seat_assignment,
-        ...(seat_assignment === 'seat' ? { seats: [Number(seat_number)] } : { seats: [] }),
+        ...(seat_assignment === 'seat' ? { seats: resolvedSeatNumbers } : { seats: [] }),
       })
       .eq('id', req.params.id)
       .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
