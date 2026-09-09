@@ -10,13 +10,17 @@ const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 const app = express();
 
 
-// Calculate a rough ETA from live GPS position to the route's end terminal.
-// Returns null when reliable live GPS/speed/destination data is unavailable.
+// Calculate a rough ETA from a bus position to the route's end terminal.
+// Browser geolocation commonly reports no speed, so use a conservative city
+// driving-speed estimate in that case instead of hiding a usable ETA.
 function calculateBusEta(currentLocation, targetLocation, speedMetersPerSecond) {
   if (!currentLocation || !targetLocation) return null;
-  if (typeof speedMetersPerSecond !== 'number' || !Number.isFinite(speedMetersPerSecond) || speedMetersPerSecond <= 0.5) {
-    return null;
-  }
+  const FALLBACK_SPEED_METERS_PER_SECOND = 25 / 3.6; // 25 km/h
+  const travelSpeed = typeof speedMetersPerSecond === 'number' &&
+    Number.isFinite(speedMetersPerSecond) &&
+    speedMetersPerSecond > 0.5
+    ? speedMetersPerSecond
+    : FALLBACK_SPEED_METERS_PER_SECOND;
 
   const toRadians = (degrees) => (degrees * Math.PI) / 180;
   const earthRadiusMeters = 6371000;
@@ -30,7 +34,7 @@ function calculateBusEta(currentLocation, targetLocation, speedMetersPerSecond) 
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   const distanceMeters = 2 * earthRadiusMeters * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-  const minutes = Math.max(1, Math.round(distanceMeters / speedMetersPerSecond / 60));
+  const minutes = Math.max(1, Math.round(distanceMeters / travelSpeed / 60));
   return `${minutes} mins`;
 }
 
@@ -3772,9 +3776,10 @@ app.get('/api/client/bus-eta', async (req, res) => {
         ? normalizeLatLng(terminalMap.get(route.end_terminal_id))
         : null;
 
-      const eta = hasRecentLiveLocation
-        ? calculateBusEta(trackedLocation, destination, tracked?.speed)
-        : null;
+      // A persisted location remains useful for a rough ETA after the live
+      // session expires. `locationSource` below still tells the client whether
+      // the position is live or the last database location.
+      const eta = calculateBusEta(currentLocation, destination, tracked?.speed);
 
       return {
         busId: bus.id,
