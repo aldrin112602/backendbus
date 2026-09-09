@@ -3730,8 +3730,15 @@ app.get('/api/client/bus-eta', async (req, res) => {
  
     if (error) throw error;
 
+    // Supabase returns a nested object for this many-to-one relationship. Keep
+    // the normalization here so a malformed/legacy relation cannot remove the
+    // route from the ETA payload consumed by the tracker.
+    const getRoute = (bus) => Array.isArray(bus.route)
+      ? bus.route[0] || null
+      : bus.route || null;
+
     const terminalIds = Array.from(new Set(
-      buses.flatMap(bus => [bus.route?.end_terminal_id].filter(Boolean))
+      buses.flatMap(bus => [getRoute(bus)?.end_terminal_id].filter(Boolean))
     ));
 
     let terminalMap = new Map();
@@ -3749,6 +3756,7 @@ app.get('/api/client/bus-eta', async (req, res) => {
     const LIVE_LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
 
     const etas = buses.map(bus => {
+      const route = getRoute(bus);
       const tracked = latestLocationsByBusId.get(bus.id);
       const trackedLocation = normalizeLatLng(tracked);
       const databaseLocation = normalizeLatLng(bus.current_location);
@@ -3760,8 +3768,8 @@ app.get('/api/client/bus-eta', async (req, res) => {
         Number.isFinite(trackedTimestamp) &&
         now - trackedTimestamp <= LIVE_LOCATION_MAX_AGE_MS;
 
-      const destination = bus.route?.end_terminal_id
-        ? normalizeLatLng(terminalMap.get(bus.route.end_terminal_id))
+      const destination = route?.end_terminal_id
+        ? normalizeLatLng(terminalMap.get(route.end_terminal_id))
         : null;
 
       const eta = hasRecentLiveLocation
@@ -3771,6 +3779,7 @@ app.get('/api/client/bus-eta', async (req, res) => {
       return {
         busId: bus.id,
         busNumber: bus.bus_number,
+        route,
         eta,
         currentLocation,
         locationSource: hasRecentLiveLocation
