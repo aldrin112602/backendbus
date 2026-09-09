@@ -102,6 +102,38 @@ const liveLocationClients = new Set();
 
 const seatReadClient = supabaseAdmin || supabase;
 
+// `available_seats` is derived state. Never adjust it with +/- counters: that
+// drifts when a booking is confirmed, cancelled, or changed by an employee.
+async function syncBusAvailability(busId) {
+  const [{ data: bus, error: busError }, { data: bookings, error: bookingsError }] = await Promise.all([
+    supabase.from('buses').select('id, total_seats').eq('id', busId).single(),
+    supabase
+      .from('bookings')
+      .select('status, seats, booking_type, seat_assignment')
+      .eq('bus_id', busId)
+      .in('status', ['pending', 'confirmed', 'boarded']),
+  ]);
+  if (busError) throw busError;
+  if (bookingsError) throw bookingsError;
+
+  const occupied = (bookings || []).reduce((count, booking) => {
+    const type = booking.booking_type || 'regular';
+    if (type === 'pickup_request') {
+      return count + (booking.seat_assignment === 'seat' ? 1 : 0);
+    }
+    return count + (Array.isArray(booking.seats) ? booking.seats.length : 0);
+  }, 0);
+  const available_seats = Math.max(0, Number(bus.total_seats || 0) - occupied);
+  const { data: updated, error: updateError } = await supabase
+    .from('buses')
+    .update({ available_seats })
+    .eq('id', busId)
+    .select()
+    .single();
+  if (updateError) throw updateError;
+  return updated;
+}
+
 async function expireStaleBookings() {
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -795,7 +827,7 @@ app.put('/api/employee/booking/:id/status', async (req, res) => {
 
     const { data: booking, error: bookingError } = await supabase
       .from('bookings')
-      .select('id, bus_id, status')
+      .select('id, bus_id, status, booking_type, seat_assignment, payment_status')
       .eq('id', id)
       .single();
     if (bookingError || !booking) return res.status(404).json({ error: 'Booking not found' });
@@ -817,6 +849,12 @@ app.put('/api/employee/booking/:id/status', async (req, res) => {
     if (!validTransition) {
       return res.status(409).json({ error: `Cannot change booking from ${booking.status} to ${status}` });
     }
+    if (status === 'boarded' && booking.booking_type === 'regular' && booking.payment_status !== 'paid') {
+      return res.status(409).json({ error: 'Regular bookings must be paid before boarding' });
+    }
+    if (status === 'boarded' && booking.booking_type === 'pickup_request' && !['seat', 'standing'].includes(booking.seat_assignment)) {
+      return res.status(409).json({ error: 'Assign a seat or standing status before boarding this pickup request' });
+    }
 
     const { data: updated, error: updateError } = await supabase
       .from('bookings')
@@ -825,6 +863,7 @@ app.put('/api/employee/booking/:id/status', async (req, res) => {
       .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
       .single();
     if (updateError) throw updateError;
+    await syncBusAvailability(booking.bus_id);
 
     res.json({ message: `Booking marked ${status}`, booking: updated });
   } catch (error) {
@@ -1025,6 +1064,8 @@ app.post('/api/client/booking', async (req, res) => {
         status: 'pending',
         payment_method: payment_method || 'cash',
         payment_status: 'pending',
+        booking_type: 'regular',
+        seat_assignment: 'reserved',
         seats: seatList,
         travel_date: travelDate,
         amount: resolvedAmount,
@@ -1035,19 +1076,7 @@ app.post('/api/client/booking', async (req, res) => {
       .single();
 
     if (error) throw error;
-
-    const { data: bus, error: busError } = await supabase
-      .from('buses')
-      .select('available_seats')
-      .eq('id', busId)
-      .single();
-    if (busError) throw busError;
-
-    const newSeats = Math.max(0, (bus.available_seats || 0) - seatList.length);
-    await supabase
-      .from('buses')
-      .update({ available_seats: newSeats })
-      .eq('id', busId);
+    await syncBusAvailability(busId);
 
     res.status(201).json(booking);
   } catch (error) {
@@ -1357,19 +1386,7 @@ app.delete('/api/client/booking/:id', async (req, res) => {
       .eq('id', id);
     if (updateErr) throw updateErr;
 
-    // Increment available seats by 1 (guard against exceeding total)
-    const { data: bus, error: busErr } = await supabase
-      .from('buses')
-      .select('available_seats, total_seats')
-      .eq('id', booking.bus_id)
-      .single();
-    if (!busErr && bus) {
-      const newSeats = Math.min(bus.total_seats, (bus.available_seats || 0) + 1);
-      await supabase
-        .from('buses')
-        .update({ available_seats: newSeats })
-        .eq('id', booking.bus_id);
-    }
+    await syncBusAvailability(booking.bus_id);
 
     res.json({ message: 'Booking cancelled' });
   } catch (error) {
@@ -1384,7 +1401,7 @@ app.get('/api/client/bookings', async (req, res) => {
     let query = supabase
       .from('bookings')
       .select(`
-        id, user_id, bus_id, status, payment_method, payment_status, seats, amount, travel_date, created_at, receipt_sent,
+        id, user_id, bus_id, status, payment_method, payment_status, booking_type, seat_assignment, seats, amount, travel_date, created_at, receipt_sent,
         pickup_address, pickup_lat, pickup_lng, pickup_location_source,
         bus:bus_id(bus_number, route:route_id(name)),
         user:user_id(username, email, profile)
@@ -1623,22 +1640,8 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
       console.warn('Admin confirm: failed to send confirmation email', emailErr && emailErr.message ? emailErr.message : emailErr);
     }
 
-    try {
-      const { data: bus } = await supabase
-        .from('buses')
-        .select('available_seats, total_seats')
-        .eq('id', booking.bus_id)
-        .single();
-      if (bus) {
-        const dec = (booking.seats?.length || 1);
-        const newSeats = Math.max(0, (bus.available_seats || 0) - dec);
-        await supabase
-          .from('buses')
-          .update({ available_seats: newSeats })
-          .eq('id', booking.bus_id);
-      }
-    } catch (seatErr) {
-      console.warn('Admin confirm: failed to adjust seats', seatErr && seatErr.message ? seatErr.message : seatErr);
+    try { await syncBusAvailability(booking.bus_id); } catch (seatErr) {
+      console.warn('Admin confirm: failed to sync seat availability', seatErr && seatErr.message ? seatErr.message : seatErr);
     }
 
     res.json(booking);
@@ -1672,19 +1675,7 @@ app.delete('/api/admin/booking/:id', async (req, res) => {
       .eq('id', id);
     if (updateErr) throw updateErr;
 
-    // Increment available seats by 1 if bus exists
-    const { data: bus } = await supabase
-      .from('buses')
-      .select('available_seats, total_seats')
-      .eq('id', booking.bus_id)
-      .single();
-    if (bus) {
-      const newSeats = Math.min(bus.total_seats, (bus.available_seats || 0) + 1);
-      await supabase
-        .from('buses')
-        .update({ available_seats: newSeats })
-        .eq('id', booking.bus_id);
-    }
+    await syncBusAvailability(booking.bus_id);
 
     res.json({ message: 'Booking cancelled' });
   } catch (error) {
@@ -3427,7 +3418,6 @@ app.put('/api/admin/bus/:id', async (req, res) => {
     const {
       bus_number,
       total_seats,
-      available_seats,
       terminal_id,
       route_id,
       status,
@@ -3449,15 +3439,6 @@ app.put('/api/admin/bus/:id', async (req, res) => {
     // Optional validations
     if (typeof total_seats === 'number' && total_seats < 0) {
       return res.status(400).json({ error: 'total_seats must be >= 0' });
-    }
-    if (typeof available_seats === 'number' && available_seats < 0) {
-      return res.status(400).json({ error: 'available_seats must be >= 0' });
-    }
-
-    const effectiveTotalSeats = typeof total_seats === 'number' ? total_seats : existingBus.total_seats;
-    const effectiveAvailableSeats = typeof available_seats === 'number' ? available_seats : existingBus.available_seats;
-    if (effectiveAvailableSeats > effectiveTotalSeats) {
-      return res.status(400).json({ error: 'available_seats cannot exceed total_seats' });
     }
 
     // Validate terminal/route existence if provided
@@ -3494,7 +3475,6 @@ app.put('/api/admin/bus/:id', async (req, res) => {
     const updatePayload = {
       ...(bus_number !== undefined ? { bus_number } : {}),
       ...(total_seats !== undefined ? { total_seats } : {}),
-      ...(available_seats !== undefined ? { available_seats } : {}),
       ...(terminal_id !== undefined ? { terminal_id } : {}),
       ...(route_id !== undefined ? { route_id } : {}),
       ...(status !== undefined ? { status } : {}),
@@ -3511,7 +3491,7 @@ app.put('/api/admin/bus/:id', async (req, res) => {
       .single();
 
     if (error) throw error;
-    res.json(updated);
+    res.json(await syncBusAvailability(id));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3858,35 +3838,8 @@ app.delete('/api/employee/report/:id', async (req, res) => {
 
 app.put('/api/employee/passenger-count/:busId', async (req, res) => {
   try {
-    const { action } = req.body; // 'add' or 'remove'
-
-    // 1. Fetch current available_seats
-    const { data: bus, error: fetchError } = await supabase
-      .from('buses')
-      .select('available_seats')
-      .eq('id', req.params.busId)
-      .single();
-    if (fetchError) throw fetchError;
-
-    // 2. Calculate new value
-    let newSeats = bus.available_seats;
-    if (action === 'add') {
-      newSeats = bus.available_seats - 1;
-    }
-    else if (action === 'remove') {
-      newSeats = bus.available_seats + 1;
-    }
-
-    // 3. Update the value
-    const { data: updatedBus, error: updateError } = await supabase
-      .from('buses')
-      .update({ available_seats: newSeats })
-      .eq('id', req.params.busId)
-      .select()
-      .single();
-    if (updateError) throw updateError;
-
-    res.json(updatedBus);
+    const bus = await syncBusAvailability(req.params.busId);
+    res.json({ ...bus, message: 'Capacity is calculated automatically from reservations and pickup assignments.' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4864,4 +4817,121 @@ process.on('SIGINT', () => {
     console.log('✅ Server closed');
     process.exit(0);
   });
+});
+
+// Employees only receive passengers for their assigned bus and selected trip
+// date. This replaces client-side filtering of every passenger record.
+app.get('/api/employee/bookings', async (req, res) => {
+  try {
+    const { employeeId, travelDate } = req.query;
+    if (!employeeId) return res.status(400).json({ error: 'employeeId is required' });
+    const { data: employee, error: employeeError } = await supabase
+      .from('users').select('assigned_bus_id').eq('id', employeeId).single();
+    if (employeeError || !employee?.assigned_bus_id) {
+      return res.status(403).json({ error: 'No bus is assigned to this employee' });
+    }
+    const day = new Date(travelDate || new Date().toISOString());
+    if (Number.isNaN(day.getTime())) return res.status(400).json({ error: 'Invalid travelDate' });
+    day.setHours(0, 0, 0, 0);
+    const nextDay = new Date(day);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const { data, error } = await supabase
+      .from('bookings')
+      .select(`
+        id, user_id, bus_id, status, payment_method, payment_status, booking_type, seat_assignment,
+        seats, amount, travel_date, created_at, receipt_sent, pickup_address, pickup_lat, pickup_lng,
+        pickup_location_source, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)
+      `)
+      .eq('bus_id', employee.assigned_bus_id)
+      .gte('travel_date', day.toISOString())
+      .lt('travel_date', nextDay.toISOString())
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
+  try {
+    const { employeeId, seat_assignment } = req.body || {};
+    if (!employeeId || !['seat', 'standing'].includes(seat_assignment)) {
+      return res.status(400).json({ error: 'employeeId and seat_assignment (seat or standing) are required' });
+    }
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .select('id, bus_id, status, booking_type')
+      .eq('id', req.params.id)
+      .single();
+    if (bookingError || !booking) return res.status(404).json({ error: 'Pickup request not found' });
+    if (booking.booking_type !== 'pickup_request' || !['pending', 'confirmed'].includes(booking.status)) {
+      return res.status(409).json({ error: 'Only active pickup requests can be assigned' });
+    }
+    const { data: employee, error: employeeError } = await supabase
+      .from('users').select('assigned_bus_id').eq('id', employeeId).single();
+    if (employeeError || employee?.assigned_bus_id !== booking.bus_id) {
+      return res.status(403).json({ error: 'You are not assigned to this bus' });
+    }
+    if (seat_assignment === 'seat') {
+      const bus = await syncBusAvailability(booking.bus_id);
+      if (bus.available_seats < 1) return res.status(409).json({ error: 'No seats available; assign standing instead' });
+    }
+    const { data: updated, error: updateError } = await supabase
+      .from('bookings')
+      .update({ seat_assignment })
+      .eq('id', req.params.id)
+      .select(`*, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)`)
+      .single();
+    if (updateError) throw updateError;
+    await syncBusAvailability(booking.bus_id);
+    res.json({ booking: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// “Pick Up Me” is intentionally not a booking: it has no fare and reserves
+// no capacity until the assigned crew chooses a seat or standing status.
+app.post('/api/client/pickup-request', async (req, res) => {
+  try {
+    const { userId, busId, travel_date, date, email } = req.body || {};
+    if (!userId || !busId) {
+      return res.status(400).json({ error: 'userId and busId are required' });
+    }
+    const travelDate = travel_date || date || new Date().toISOString();
+    const { data: existing, error: existingError } = await supabase
+      .from('bookings')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('bus_id', busId)
+      .eq('booking_type', 'pickup_request')
+      .in('status', ['pending', 'confirmed', 'boarded'])
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (existingError) throw existingError;
+    if (existing?.[0]) return res.status(200).json(existing[0]);
+
+    const { data: request, error } = await supabase
+      .from('bookings')
+      .insert({
+        user_id: userId,
+        bus_id: busId,
+        status: 'pending',
+        payment_method: 'cash',
+        payment_status: 'pending',
+        booking_type: 'pickup_request',
+        seat_assignment: 'unassigned',
+        seats: [],
+        amount: 0,
+        travel_date: travelDate,
+        email: email || null,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(request);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
