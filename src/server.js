@@ -159,7 +159,7 @@ async function findSeatConflicts(busId, travelDate, seatList) {
       .select('seats')
       .eq('bus_id', busId)
       .eq('travel_date', travelDate)
-      .neq('status', 'cancelled');
+      .in('status', ['pending', 'confirmed', 'boarded']);
     if (error) throw error;
     const taken = new Set();
     (data || []).forEach((b) => (b.seats || []).forEach((s) => taken.add(String(s))));
@@ -175,7 +175,7 @@ async function findSeatConflicts(busId, travelDate, seatList) {
     .from('bookings')
     .select('seats')
     .eq('bus_id', busId)
-    .neq('status', 'cancelled')
+    .in('status', ['pending', 'confirmed', 'boarded'])
     .gte('travel_date', dayStart.toISOString())
     .lt('travel_date', dayEnd.toISOString());
 
@@ -942,7 +942,7 @@ app.get('/api/buses/:busId/booked-seats', async (req, res) => {
       .from('bookings')
       .select('seats')
       .eq('bus_id', busId)
-      .neq('status', 'cancelled')
+      .in('status', ['pending', 'confirmed', 'boarded'])
       .gte('travel_date', dayStart.toISOString())
       .lt('travel_date', dayEnd.toISOString());
 
