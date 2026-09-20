@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const Stripe = require('stripe');
 const crypto = require('crypto');
+const { calculateBookingPrice, receiptPricingRows } = require('./bookingPricing');
 const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 
 const app = express();
@@ -265,84 +266,8 @@ app.post('/api/create-payment-session', async (req, res) => {
   });
 });
 
-app.post('/__disabled/api/create-payment-session', async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({ error: 'Stripe is not configured' });
-  }
-
-  try {
-    const { userId, busId, seats, routeName, date } = req.body;
-    const seatCount = Array.isArray(seats) && seats.length ? seats.length : 1;
-    const { data: fareBus, error: fareBusError } = await supabase
-      .from('buses')
-      .select('route:routes(fare_per_seat)')
-      .eq('id', busId)
-      .single();
-    if (fareBusError || !fareBus) {
-      return res.status(400).json({ error: 'Invalid busId' });
-    }
-    const totalPrice = Number((Number(fareBus.route?.fare_per_seat ?? 15) * seatCount).toFixed(2));
-
-    // Create a pending booking in the database
-    const { data: booking, error: bookingError } = await supabase
-      .from('bookings')
-      .insert([{
-        user_id: userId,
-        bus_id: busId,
-        seats: seats,
-        status: 'pending',
-        payment_status: 'pending',
-        payment_method: 'online',
-        amount: totalPrice,
-        created_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
-
-    if (bookingError) throw bookingError;
-
-    // Create Stripe checkout session
-    const origin =
-      process.env.FRONTEND_URL ||
-      process.env.VITE_FRONTEND_URL ||
-      req.headers.origin ||
-      (req.get('referer') ? new URL(req.get('referer')).origin : 'https://auroride.xyz');
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'php',
-          product_data: {
-            name: `Bus Booking - ${routeName}`,
-            description: `${seats.length} seat(s) for ${date}`,
-          },
-          unit_amount: Math.round(totalPrice * 100), // Stripe expects amounts in centavos for PHP
-        },
-        quantity: 1,
-      }],
-      mode: 'payment',
-      success_url: `${origin}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${origin}/booking?bookingId=${booking.id}`,
-      metadata: {
-        booking_id: booking.id,
-        user_id: userId,
-        seats: seats.join(','),
-        route_name: routeName,
-        date: date
-      }
-    });
-
-    // Update booking with session ID
-    await supabase
-      .from('bookings')
-      .update({ payment_intent_id: session.payment_intent })
-      .eq('id', booking.id);
-
-    res.json({ sessionId: session.id });
-  } catch (error) {
-    console.error('Payment session creation failed:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.post('/__disabled/api/create-payment-session', (req, res) => {
+  return res.status(410).json({ error: 'Use /api/client/create-payment-session.' });
 });
 
 // Handle Stripe webhook
@@ -433,7 +358,7 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
                 </div>
                 <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e6e8ef;border-radius:10px;overflow:hidden;">
                   <tr style="background-color:#f9fafb;">
-                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Booking ID</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Reference ID</td>
                     <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${booking.id}</td>
                   </tr>
                   <tr>
@@ -448,6 +373,7 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
                     <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Seats</td>
                     <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeSeats}</td>
                   </tr>
+                  ${receiptPricingRows(booking)}
                   <tr style="background-color:#f9fafb;">
                     <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Total Paid</td>
                     <td style="padding:12px 16px;">
@@ -532,7 +458,7 @@ const sendConfirmationEmail = async ({ to, booking, routeName, date }) => {
                 </div>
                 <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e6e8ef;border-radius:10px;overflow:hidden;">
                   <tr style="background-color:#f9fafb;">
-                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Booking ID</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Reference ID</td>
                     <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${booking.id}</td>
                   </tr>
                   <tr>
@@ -998,160 +924,8 @@ app.get('/api/buses/:busId/booked-seats', async (req, res) => {
   }
 });
 
-app.post('/api/client/booking', async (req, res) => {
-  try {
-    const {
-      userId,
-      busId,
-      trip_id,
-      seats,
-      seat_number,
-      travel_date,
-      date,
-      email,
-      payment_method,
-      pickup_address,
-      pickup_lat,
-      pickup_lng,
-      pickup_location_source,
-      seat_assignment,
-      standing_count,
-    } = req.body;
-
-    const isStanding = seat_assignment === 'standing';
-
-    const seatList = Array.isArray(seats) && seats.length
-      ? seats
-      : seat_number != null
-        ? [seat_number]
-        : [];
-
-    if (!busId) {
-      return res.status(400).json({ error: 'busId is required' });
-    }
-    let resolvedTripId = null;
-    if (trip_id) {
-      const { data: trip, error: tripError } = await supabase.from('bus_trips')
-        .select('id, bus_id, status').eq('id', trip_id).single();
-      if (tripError || !trip || trip.bus_id !== busId) return res.status(400).json({ error: 'Invalid trip for this bus' });
-      if (!['scheduled', 'boarding'].includes(trip.status)) return res.status(409).json({ error: 'This trip is no longer accepting bookings. Please choose the next departure.' });
-      resolvedTripId = trip.id;
-    }
-    if (!isStanding && seatList.length === 0) {
-      return res.status(400).json({ error: 'At least one seat is required' });
-    }
-    if (isStanding && seatList.length > 0) {
-      return res.status(400).json({ error: 'A standing booking cannot include seat numbers' });
-    }
-    const standingCount = isStanding ? Number(standing_count || 1) : 0;
-    if (!Number.isInteger(standingCount) || standingCount < 1 || standingCount > 4) {
-      return res.status(400).json({ error: 'standing_count must be between 1 and 4' });
-    }
-
-    const isValidUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-    const resolvedUserId = isValidUUID(userId) ? userId : null;
-    if (resolvedUserId) {
-      const { data: existingUser } = await supabase
-        .from('users')
-        .select('id')
-        .eq('id', resolvedUserId)
-        .single();
-      if (!existingUser) {
-        const userEmail = email || req.body.email || '';
-        const username = userEmail ? userEmail.split('@')[0] : 'user';
-        await supabase
-          .from('users')
-          .insert({ id: resolvedUserId, email: userEmail, username, role: 'client', profile: {} });
-      }
-    }
-
-    const travelDate = travel_date || date || null;
-
-    const { data: busForFare, error: busForFareError } = await supabase
-      .from('buses')
-      .select('route_id, available_seats, available_standing, route:routes(fare_per_seat)')
-      .eq('id', busId)
-      .single();
-    if (busForFareError || !busForFare) {
-      return res.status(400).json({ error: 'Invalid busId' });
-    }
-
-    let discountMultiplier = 1.0;
-    if (resolvedUserId) {
-      const { data: discount } = await supabase
-        .from('discount_verifications')
-        .select('status')
-        .eq('user_id', resolvedUserId)
-        .eq('status', 'approved')
-        .maybeSingle();
-
-      if (discount) {
-        discountMultiplier = 0.8;
-      }
-    }
-
-    const farePerSeat = Number(busForFare.route?.fare_per_seat ?? 15);
-    const passengerCount = isStanding ? standingCount : seatList.length;
-    const resolvedAmount = Number((farePerSeat * passengerCount * discountMultiplier).toFixed(2));
-
-    // Prevent double-booking: reject if any requested seat is already
-    // held by another non-cancelled booking for this bus + date.
-    const seatConflicts = isStanding ? [] : await findSeatConflicts(busId, travelDate, seatList, resolvedTripId);
-    if (seatConflicts.length > 0) {
-      return res.status(409).json({
-        error: `Seat(s) already taken: ${seatConflicts.join(', ')}. Please choose different seat(s).`,
-        conflictingSeats: seatConflicts,
-      });
-    }
-    const refreshedBus = await getTripAvailability(busId, resolvedTripId);
-    if (isStanding && Number(refreshedBus.available_standing || 0) < standingCount) {
-      return res.status(409).json({ error: 'No standing slots are available on this bus.' });
-    }
-    if (!isStanding && Number(refreshedBus.available_seats || 0) < seatList.length) {
-      return res.status(409).json({ error: 'Not enough seats are available. You may book as standing if standing slots remain.' });
-    }
-
-    const pickupPayload =
-      pickup_lat != null &&
-      pickup_lng != null &&
-      Number.isFinite(Number(pickup_lat)) &&
-      Number.isFinite(Number(pickup_lng))
-        ? {
-            pickup_address: pickup_address || null,
-            pickup_lat: Number(pickup_lat),
-            pickup_lng: Number(pickup_lng),
-            pickup_location_source: pickup_location_source || 'search',
-          }
-        : {};
-
-    const { data: booking, error } = await supabase
-      .from('bookings')
-      .insert({
-        user_id: resolvedUserId,
-        bus_id: busId,
-        trip_id: resolvedTripId,
-        status: 'pending',
-        payment_method: payment_method || 'cash',
-        payment_status: 'pending',
-        booking_type: 'regular',
-        seat_assignment: isStanding ? 'standing' : 'reserved',
-        seats: isStanding ? [] : seatList,
-        standing_count: standingCount,
-        travel_date: travelDate,
-        amount: resolvedAmount,
-        email: email || null,
-        ...pickupPayload,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    await syncBusAvailability(busId);
-
-    res.status(201).json(booking);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+app.post('/api/client/booking', (req, res) => {
+  return res.status(400).json({ error: 'Regular bookings require online payment. Use online checkout.' });
 });
 
 // Save / update passenger pickup location on a booking
@@ -1161,7 +935,7 @@ app.patch('/api/client/booking/:id/pickup', async (req, res) => {
     const { pickup_address, pickup_lat, pickup_lng, pickup_location_source, userId } = req.body || {};
 
     if (!id) {
-      return res.status(400).json({ error: 'Booking id is required' });
+      return res.status(400).json({ error: 'Reference ID is required' });
     }
 
     const lat = pickup_lat != null ? Number(pickup_lat) : NaN;
@@ -1241,49 +1015,30 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       }
     }
 
-    // Resolve route name and fare from bus -> routes
-    let resolvedRouteName = null;
-    let farePerSeat = 15;
-    try {
-      const { data: busRow } = await supabase
-        .from('buses')
-        .select('route_id')
-        .eq('id', busId)
-        .single();
-      const routeId = busRow?.route_id || null;
-      if (routeId) {
-        const { data: routeRow } = await supabase
-          .from('routes')
-          .select('name, fare_per_seat')
-          .eq('id', routeId)
-          .single();
-        resolvedRouteName = routeRow?.name || null;
-        farePerSeat = Number(routeRow?.fare_per_seat ?? 15);
-      }
-    } catch (_) {
-      // best-effort only
-    }
+    // Read the current fare; do not silently charge a fallback on lookup failure.
+    const { data: busRow, error: busError } = await supabase.from('buses')
+      .select('route_id').eq('id', busId).single();
+    if (busError || !busRow?.route_id) return res.status(400).json({ error: 'Bus or route unavailable. Please choose another bus.' });
+    const { data: routeRow, error: routeError } = await supabase.from('routes')
+      .select('name, fare_per_seat').eq('id', busRow.route_id).single();
+    if (routeError || !routeRow) return res.status(400).json({ error: 'Route fare unavailable. Please try again.' });
+    const resolvedRouteName = routeRow.name || null;
+    const farePerSeat = Number(routeRow.fare_per_seat ?? 15);
 
-    // Check for approved discount
-    let discountMultiplier = 1.0;
+    // Snapshot verified pricing for historical receipts.
+    let approvedDiscount = null;
     if (resolvedUserId) {
-      const { data: discount } = await supabase
-        .from('discount_verifications')
-        .select('status')
-        .eq('user_id', resolvedUserId)
-        .eq('status', 'approved')
-        .maybeSingle();
-      
-      if (discount) {
-        discountMultiplier = 0.8; // 20% discount
-      }
+      const { data: discount, error: discountError } = await supabase
+        .from('discount_verifications').select('status, type')
+        .eq('user_id', resolvedUserId).eq('status', 'approved').maybeSingle();
+      if (discountError) throw discountError;
+      approvedDiscount = discount;
     }
-
-    // Calculate amount with discount
     const seatCount = isStanding ? standingCount : seats.length;
-    const finalAmount = Number((farePerSeat * seatCount * discountMultiplier).toFixed(2));
+    const pricing = calculateBookingPrice(farePerSeat, seatCount, approvedDiscount);
+    const finalAmount = pricing.amount;
 
-    // Prevent double-booking, same as the cash-payment endpoint.
+    // Recheck capacity before creating the online booking.
     const seatConflicts = isStanding ? [] : await findSeatConflicts(busId, date, seats || [], resolvedTripId);
     if (seatConflicts.length > 0) {
       return res.status(409).json({
@@ -1312,7 +1067,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       seats: isStanding ? [] : seats,
       standing_count: standingCount,
       travel_date: date || null,
-      amount: finalAmount,
+      ...pricing,
       email: email,
     };
 
@@ -1499,7 +1254,7 @@ app.get('/api/client/bookings', async (req, res) => {
     let query = supabase
       .from('bookings')
       .select(`
-        id, user_id, bus_id, status, payment_method, payment_status, booking_type, seat_assignment, seats, amount, travel_date, created_at, receipt_sent,
+        id, user_id, bus_id, trip_id, status, payment_method, payment_status, booking_type, seat_assignment, standing_count, seats, amount, fare_per_passenger, passenger_count, subtotal, discount_type, discount_percent, discount_amount, travel_date, created_at, receipt_sent,
         pickup_address, pickup_lat, pickup_lng, pickup_location_source,
         bus:bus_id(bus_number, route:route_id(name)),
         user:user_id(username, email, profile)
