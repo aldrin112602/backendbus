@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "src/server.js",
   "scripts": {
+    "test": "node --test src/*.test.js",
+    "test:seats": "node --test src/seatPolicy.test.js src/pickupSeatPolicy.test.js src/prioritySeats.database.test.js src/bookingPricing.test.js",
     "test:password-reset": "node --test src/passwordReset.test.js",
     "dev": "node src/server.js",
     "start": "node src/server.js",
@@ -18,5 +20,8 @@
     "express": "^4.18.2",
     "nodemailer": "^10.0.10",
     "stripe": "^14.5.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
   }
 }

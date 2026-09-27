@@ -102,6 +102,9 @@ const latestLocationsByBusId = new Map();
 const liveLocationClients = new Set();
 
 const seatReadClient = supabaseAdmin || supabase;
+const { validateSeats, priorityCategory, manilaDay } = require('./seatPolicy');
+const { createSeatPolicyService, seatErrorStatus } = require('./seatPolicyService');
+const seatPolicy = createSeatPolicyService(supabaseAdmin, supabase.auth);
 
 // `available_seats` is derived state. Never adjust it with +/- counters: that
 // drifts when a booking is confirmed, cancelled, or changed by an employee.
@@ -191,32 +194,15 @@ async function findSeatConflicts(busId, travelDate, seatList, tripId = null) {
     const taken = new Set((data || []).flatMap((booking) => (booking.seats || []).map(String)));
     return seatList.filter((seat) => taken.has(String(seat)));
   }
-  const day = new Date(travelDate);
-  if (Number.isNaN(day.getTime())) {
-    const { data, error } = await seatReadClient
-      .from('bookings')
-      .select('seats')
-      .eq('bus_id', busId)
-      .eq('travel_date', travelDate)
-      .in('status', ['pending', 'confirmed', 'boarded']);
-    if (error) throw error;
-    const taken = new Set();
-    (data || []).forEach((b) => (b.seats || []).forEach((s) => taken.add(String(s))));
-    return seatList.filter((s) => taken.has(String(s)));
-  }
-
-  const dayStart = new Date(day);
-  dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(dayStart);
-  dayEnd.setDate(dayEnd.getDate() + 1);
-
+  const { start, end } = manilaDay(travelDate);
   const { data, error } = await seatReadClient
     .from('bookings')
     .select('seats')
     .eq('bus_id', busId)
+    .is('trip_id', null)
     .in('status', ['pending', 'confirmed', 'boarded'])
-    .gte('travel_date', dayStart.toISOString())
-    .lt('travel_date', dayEnd.toISOString());
+    .gte('travel_date', start)
+    .lt('travel_date', end);
 
   if (error) throw error;
 
@@ -888,39 +874,25 @@ app.get('/api/rt/notifications/:userId', (req, res) => {
 app.get('/api/buses/:busId/booked-seats', async (req, res) => {
   try {
     const { busId } = req.params;
-    const { date, tripId } = req.query;
-    if (!busId || !date) {
-      return res.status(400).json({ error: 'busId and date are required' });
+    const { date, tripId, pickupBookingId } = req.query;
+    const actor = await seatPolicy.actor(req, Boolean(pickupBookingId));
+    let userId = actor?.id;
+    if (pickupBookingId) {
+      await seatPolicy.conductor(actor.id, busId);
+      const { data: booking, error } = await supabaseAdmin.from('bookings')
+        .select('id,user_id,bus_id,trip_id,travel_date,booking_type').eq('id', pickupBookingId).single();
+      if (error || booking?.bus_id !== busId || booking.booking_type !== 'pickup_request' ||
+          (booking.trip_id || null) !== (tripId || null) ||
+          (!tripId && manilaDay(booking.travel_date).start !== manilaDay(date).start)) {
+        return res.status(400).json({ error: 'Invalid pickup request for this departure.' });
+      }
+      userId = booking.user_id;
     }
-
-    const day = new Date(date);
-    if (Number.isNaN(day.getTime())) {
-      return res.status(400).json({ error: 'Invalid date' });
-    }
-    const dayStart = new Date(day);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(dayStart);
-    dayEnd.setDate(dayEnd.getDate() + 1);
-
-    let bookedSeatsQuery = seatReadClient
-      .from('bookings')
-      .select('seats')
-      .eq('bus_id', busId)
-      .in('status', ['pending', 'confirmed', 'boarded']);
-    bookedSeatsQuery = tripId
-      ? bookedSeatsQuery.eq('trip_id', tripId)
-      : bookedSeatsQuery.gte('travel_date', dayStart.toISOString()).lt('travel_date', dayEnd.toISOString());
-    const { data, error } = await bookedSeatsQuery;
-
-    if (error) throw error;
-
-    const takenSeats = Array.from(
-      new Set((data || []).flatMap((b) => (b.seats || []).map((s) => Number(s))))
-    ).sort((a, b) => a - b);
-
-    res.json({ bookedSeats: takenSeats });
+    const context = await seatPolicy.context(busId, date, tripId, userId, pickupBookingId);
+    const { bookings, bus, category, ...policy } = context;
+    res.json({ bookedSeats: [...new Set(bookings.flatMap(b => (b.seats || []).map(Number)))].sort((a,b) => a-b), ...policy });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(seatErrorStatus(error)).json({ error: error.message });
   }
 });
 
@@ -980,11 +952,15 @@ app.post('/api/client/create-payment-session', async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured on server.' });
 
-    const { userId, email, busId, trip_id, seats = [], date, seat_assignment, standing_count } = req.body;
+    const actor = await seatPolicy.actor(req);
+    if (req.body.userId && req.body.userId !== actor.id) return res.status(403).json({ error: 'Passenger identity does not match your session.' });
+    const { busId, trip_id, seats = [], date, seat_assignment, standing_count } = req.body;
+    const userId = actor.id;
+    const email = actor.email;
     if (!userId || !busId || !email) return res.status(400).json({ error: 'userId, email and busId are required' });
     let resolvedTripId = null;
     if (trip_id) {
-      const { data: trip, error: tripError } = await supabase.from('bus_trips')
+      const { data: trip, error: tripError } = await supabaseAdmin.from('bus_trips')
         .select('id, bus_id, status').eq('id', trip_id).single();
       if (tripError || !trip || trip.bus_id !== busId) return res.status(400).json({ error: 'Invalid trip for this bus' });
       if (!['scheduled', 'boarding'].includes(trip.status)) return res.status(409).json({ error: 'This trip is no longer accepting bookings. Please choose the next departure.' });
@@ -1003,23 +979,23 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     const resolvedUserId = isValidUUID(userId) ? userId : null;
 
     if (resolvedUserId) {
-      const { data: existingUser } = await supabase
+      const { data: existingUser } = await supabaseAdmin
         .from('users')
         .select('id')
         .eq('id', resolvedUserId)
         .single();
       if (!existingUser) {
-        await supabase
+        await supabaseAdmin
           .from('users')
           .insert({ id: resolvedUserId, email, username: email.split('@')[0], role: 'client', profile: {} });
       }
     }
 
     // Read the current fare; do not silently charge a fallback on lookup failure.
-    const { data: busRow, error: busError } = await supabase.from('buses')
+    const { data: busRow, error: busError } = await supabaseAdmin.from('buses')
       .select('route_id').eq('id', busId).single();
     if (busError || !busRow?.route_id) return res.status(400).json({ error: 'Bus or route unavailable. Please choose another bus.' });
-    const { data: routeRow, error: routeError } = await supabase.from('routes')
+    const { data: routeRow, error: routeError } = await supabaseAdmin.from('routes')
       .select('name, fare_per_seat').eq('id', busRow.route_id).single();
     if (routeError || !routeRow) return res.status(400).json({ error: 'Route fare unavailable. Please try again.' });
     const resolvedRouteName = routeRow.name || null;
@@ -1028,11 +1004,15 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     // Snapshot verified pricing for historical receipts.
     let approvedDiscount = null;
     if (resolvedUserId) {
-      const { data: discount, error: discountError } = await supabase
+      const { data: discount, error: discountError } = await supabaseAdmin
         .from('discount_verifications').select('status, type')
         .eq('user_id', resolvedUserId).eq('status', 'approved').maybeSingle();
       if (discountError) throw discountError;
       approvedDiscount = discount;
+    }
+    if (!isStanding) {
+      const policy = await seatPolicy.context(busId, date, resolvedTripId, userId);
+      validateSeats({ seats, totalSeats: policy.bus.total_seats, category: policy.category, otherPrioritySeat: policy.otherPrioritySeat });
     }
     const seatCount = isStanding ? standingCount : seats.length;
     const pricing = calculateBookingPrice(farePerSeat, seatCount, approvedDiscount);
@@ -1071,7 +1051,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       email: email,
     };
 
-    const { data: booking, error: bookingErr } = await supabase
+    const { data: booking, error: bookingErr } = await supabaseAdmin
       .from('bookings')
       .insert(bookingPayload)
       .select()
@@ -1114,7 +1094,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     });
 
     // Store session id on booking for webhook correlation
-    await supabase
+    await supabaseAdmin
       .from('bookings')
       .update({ checkout_session_id: session.id, payment_intent_id: session.payment_intent || null })
       .eq('id', booking.id);
@@ -1122,7 +1102,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     res.json({ url: session.url, sessionId: session.id });
   } catch (error) {
     console.error('create-payment-session error', error);
-    res.status(500).json({ error: error.message || 'Failed to create payment session' });
+    res.status(seatErrorStatus(error)).json({ error: error.message || 'Failed to create payment session' });
   }
 });
 
@@ -3218,6 +3198,7 @@ app.get('/api/admin/route/:id', async (req, res) => {
 app.post('/api/admin/bus', async (req, res) => {
   try {
     const { bus_number, total_seats, standing_capacity, terminal_id, route_id } = req.body;
+    if (!Number.isInteger(total_seats) || total_seats < 8) return res.status(400).json({ error: 'A bus requires at least 8 seats.' });
     const resolvedStandingCapacity = Number(standing_capacity || 0);
     if (!Number.isInteger(resolvedStandingCapacity) || resolvedStandingCapacity < 0) {
       return res.status(400).json({ error: 'standing_capacity must be a non-negative whole number' });
@@ -3300,8 +3281,8 @@ app.put('/api/admin/bus/:id', async (req, res) => {
     }
 
     // Optional validations
-    if (typeof total_seats === 'number' && total_seats < 0) {
-      return res.status(400).json({ error: 'total_seats must be >= 0' });
+    if (total_seats !== undefined && (!Number.isInteger(total_seats) || total_seats < 8)) {
+      return res.status(400).json({ error: 'A bus requires at least 8 seats.' });
     }
     if (standing_capacity !== undefined && (!Number.isInteger(Number(standing_capacity)) || Number(standing_capacity) < 0)) {
       return res.status(400).json({ error: 'standing_capacity must be a non-negative whole number' });
@@ -4736,57 +4717,56 @@ process.on('SIGINT', () => {
 // date. This replaces client-side filtering of every passenger record.
 app.get('/api/employee/bookings', async (req, res) => {
   try {
-    const { employeeId, travelDate } = req.query;
+    const actor = await seatPolicy.actor(req);
+    if (req.query.employeeId && req.query.employeeId !== actor.id) return res.status(403).json({ error: 'Employee identity does not match your session.' });
+    const employeeId = actor.id;
+    const { travelDate } = req.query;
     if (!employeeId) return res.status(400).json({ error: 'employeeId is required' });
-    const { data: employee, error: employeeError } = await supabase
-      .from('users').select('assigned_bus_id').eq('id', employeeId).single();
-    if (employeeError || !employee?.assigned_bus_id) {
+    const { data: employee, error: employeeError } = await supabaseAdmin
+      .from('users').select('role,status,assigned_bus_id').eq('id', employeeId).single();
+    if (employeeError || !employee?.assigned_bus_id || employee.status !== 'active' || !['driver','conductor','employee'].includes(employee.role)) {
       return res.status(403).json({ error: 'No bus is assigned to this employee' });
     }
-    const day = new Date(travelDate || new Date().toISOString());
-    if (Number.isNaN(day.getTime())) return res.status(400).json({ error: 'Invalid travelDate' });
-    day.setHours(0, 0, 0, 0);
-    const nextDay = new Date(day);
-    nextDay.setDate(nextDay.getDate() + 1);
-    const { data, error } = await supabase
+    const { start, end } = manilaDay(travelDate || new Date().toISOString());
+    const { data, error } = await supabaseAdmin
       .from('bookings')
       .select(`
-        id, user_id, bus_id, status, payment_method, payment_status, booking_type, seat_assignment,
-        seats, standing_count, amount, travel_date, created_at, receipt_sent, pickup_address, pickup_lat, pickup_lng,
+        id, user_id, bus_id, trip_id, status, payment_method, payment_status, booking_type, seat_assignment,
+        seats, priority_category, priority_verified_by, priority_verified_at, standing_count, amount, travel_date, created_at, receipt_sent, pickup_address, pickup_lat, pickup_lng,
         pickup_location_source, bus:bus_id(bus_number, route:route_id(name)), user:user_id(username, email, profile)
       `)
       .eq('bus_id', employee.assigned_bus_id)
-      .gte('travel_date', day.toISOString())
-      .lt('travel_date', nextDay.toISOString())
+      .gte('travel_date', start)
+      .lt('travel_date', end)
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(seatErrorStatus(error)).json({ error: error.message });
   }
 });
 
 app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
   try {
-    const { employeeId, seat_assignment, seat_number, seat_numbers, standing_count } = req.body || {};
+    const actor = await seatPolicy.actor(req);
+    const employeeId = actor.id;
+    if (req.body.employeeId && req.body.employeeId !== employeeId) return res.status(403).json({ error: 'Conductor identity does not match your session.' });
+    const { seat_assignment, seat_number, seat_numbers, standing_count, passenger_category, physical_id_confirmed } = req.body || {};
     if (!employeeId || !['seat', 'standing'].includes(seat_assignment)) {
       return res.status(400).json({ error: 'employeeId and seat_assignment (seat or standing) are required' });
     }
-    const { data: booking, error: bookingError } = await supabase
+    const { data: booking, error: bookingError } = await supabaseAdmin
       .from('bookings')
-      .select('id, bus_id, trip_id, status, booking_type, seat_assignment, travel_date, seats, standing_count')
+      .select('id, user_id, bus_id, trip_id, status, booking_type, seat_assignment, travel_date, seats, standing_count, priority_category, priority_verified_by, priority_verified_at')
       .eq('id', req.params.id)
       .single();
     if (bookingError || !booking) return res.status(404).json({ error: 'Pickup request not found' });
     if (booking.booking_type !== 'pickup_request' || !['pending', 'confirmed'].includes(booking.status)) {
       return res.status(409).json({ error: 'Only active pickup requests can be assigned' });
     }
-    const { data: employee, error: employeeError } = await supabase
-      .from('users').select('assigned_bus_id').eq('id', employeeId).single();
-    if (employeeError || employee?.assigned_bus_id !== booking.bus_id) {
-      return res.status(403).json({ error: 'You are not assigned to this bus' });
-    }
+    await seatPolicy.conductor(employeeId, booking.bus_id);
     let resolvedSeatNumbers = [];
+    let confirmation = {};
     const standingCount = seat_assignment === 'standing' ? Number(standing_count || 1) : 0;
     if (!Number.isInteger(standingCount) || standingCount < 0 || standingCount > 4) {
       return res.status(400).json({ error: 'standing_count must be between 1 and 4' });
@@ -4804,6 +4784,15 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
         return res.status(400).json({ error: 'One or more seat numbers are outside this bus capacity' });
       }
       const existingSeats = Array.isArray(booking.seats) ? booking.seats.map(Number) : [];
+      const policy = await seatPolicy.context(booking.bus_id, booking.travel_date, booking.trip_id, booking.user_id, booking.id);
+      const addedPriority = uniqueSeats.filter(n => n <= 8 && !existingSeats.includes(n));
+      if (addedPriority.length && (physical_id_confirmed !== true || !priorityCategory(passenger_category))) {
+        return res.status(400).json({ error: 'Check the physical senior/PWD ID and confirm its category first.' });
+      }
+      validateSeats({ seats: uniqueSeats, totalSeats: bus.total_seats, existingSeats,
+        category: priorityCategory(passenger_category), otherPrioritySeat: policy.otherPrioritySeat });
+      if (addedPriority.length) confirmation = { priority_category: passenger_category, priority_verified_by: employeeId, priority_verified_at: new Date().toISOString() };
+      if (!uniqueSeats.some(n => n <= 8)) confirmation = { priority_category: null, priority_verified_by: null, priority_verified_at: null };
       const seatDelta = uniqueSeats.length - existingSeats.length;
       if (seatDelta > 0 && bus.available_seats < seatDelta) {
         return res.status(409).json({ error: 'No seats available; assign standing instead' });
@@ -4816,6 +4805,7 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
       resolvedSeatNumbers = uniqueSeats;
     }
     if (seat_assignment === 'standing') {
+      confirmation = { priority_category: null, priority_verified_by: null, priority_verified_at: null };
       const bus = await getTripAvailability(booking.bus_id, booking.trip_id);
       const existingStanding = booking.seat_assignment === 'standing'
         ? Math.max(1, Number(booking.standing_count || 0))
@@ -4825,10 +4815,11 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
         return res.status(409).json({ error: 'No standing slots are available on this bus' });
       }
     }
-    const { data: updated, error: updateError } = await supabase
+    const { data: updated, error: updateError } = await supabaseAdmin
       .from('bookings')
       .update({
         seat_assignment,
+        ...confirmation,
         ...(seat_assignment === 'seat' ? { seats: resolvedSeatNumbers } : { seats: [] }),
         standing_count: standingCount,
       })
@@ -4839,7 +4830,7 @@ app.put('/api/employee/booking/:id/seat-assignment', async (req, res) => {
     await syncBusAvailability(booking.bus_id);
     res.json({ booking: updated });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(seatErrorStatus(error)).json({ error: error.message });
   }
 });
 
@@ -4883,7 +4874,11 @@ app.put('/api/employee/booking/:id/fare', async (req, res) => {
 // no capacity until the assigned crew chooses a seat or standing status.
 app.post('/api/client/pickup-request', async (req, res) => {
   try {
-    const { userId, busId, trip_id, travel_date, date, email } = req.body || {};
+    const actor = await seatPolicy.actor(req);
+    if (req.body.userId && req.body.userId !== actor.id) return res.status(403).json({ error: 'Passenger identity does not match your session.' });
+    const { busId, trip_id, travel_date, date } = req.body || {};
+    const userId = actor.id;
+    const email = actor.email;
     if (!userId || !busId) {
       return res.status(400).json({ error: 'userId and busId are required' });
     }
@@ -4896,7 +4891,7 @@ app.post('/api/client/pickup-request', async (req, res) => {
       resolvedTripId = trip.id;
     }
     const travelDate = travel_date || date || new Date().toISOString();
-    const { data: existing, error: existingError } = await supabase
+    const { data: existing, error: existingError } = await supabaseAdmin
       .from('bookings')
       .select('*')
       .eq('user_id', userId)
@@ -4908,7 +4903,7 @@ app.post('/api/client/pickup-request', async (req, res) => {
     if (existingError) throw existingError;
     if (existing?.[0]) return res.status(200).json(existing[0]);
 
-    const { data: request, error } = await supabase
+    const { data: request, error } = await supabaseAdmin
       .from('bookings')
       .insert({
         user_id: userId,
@@ -4929,6 +4924,6 @@ app.post('/api/client/pickup-request', async (req, res) => {
     if (error) throw error;
     res.status(201).json(request);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(seatErrorStatus(error)).json({ error: error.message });
   }
 });

@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { calculateBookingPrice, receiptPricingRows } = require('./bookingPricing');
+const { validateSeats } = require('./seatPolicy');
+const { seatErrorStatus } = require('./seatPolicyService');
 
 for (const type of ['pwd', 'student', 'senior_citizen']) {
   test(`${type}: 20% applies to the whole booking`, () => {
@@ -64,7 +66,11 @@ function checkoutHarness({ conflict = false, stripeFails = false, discountStatus
     return query;
   } };
   const handler = route("app.post('/api/client/create-payment-session',", '// Stripe webhook endpoint', {
-    supabase, calculateBookingPrice,
+    supabase, supabaseAdmin: supabase, calculateBookingPrice, validateSeats, seatErrorStatus,
+    seatPolicy: {
+      actor: async () => ({ id: '12345678-1234-4123-8123-123456789012', email: 'test@example.test' }),
+      context: async () => ({ bus: { total_seats: 40 }, category: discountStatus === 'approved' ? 'pwd' : null, otherPrioritySeat: false }),
+    },
     stripe: { checkout: { sessions: { create: async data => { charges.push(data); if (stripeFails) throw Error('Checkout unavailable'); return { id: 'session', url: 'https://checkout.example.test' }; } } } },
     findSeatConflicts: async () => conflict ? [1] : [],
     getTripAvailability: async () => ({ available_seats: 10, available_standing: 4 }),
@@ -73,7 +79,7 @@ function checkoutHarness({ conflict = false, stripeFails = false, discountStatus
   });
   return { handler, inserts, charges };
 }
-const request = () => ({ body: { userId: '12345678-1234-4123-8123-123456789012', email: 'test@example.test', busId: 'bus', seats: [1, 2], date: '2026-10-10', totalAmount: 1 } });
+const request = () => ({ body: { userId: '12345678-1234-4123-8123-123456789012', email: 'test@example.test', busId: 'bus', seats: [9, 10], date: '2026-10-10', totalAmount: 1 } });
 test('checkout stores current server pricing and charges that same amount', async () => {
   const h = checkoutHarness(); const res = response();
   await h.handler(request(), res);
@@ -107,7 +113,7 @@ test('pickup requests retain cash without reserving seats', async () => {
     single: async () => ({ data: { id: 'pickup', ...inserted } }),
   };
   vm.runInNewContext(source.slice(source.indexOf("app.post('/api/client/pickup-request',")), {
-    app: { post: (_, fn) => { handler = fn; } }, supabase: { from: () => query },
+    app: { post: (_, fn) => { handler = fn; } }, supabaseAdmin: { from: () => query }, supabase: { from: () => query }, seatErrorStatus, seatPolicy: { actor: async () => ({ id: 'user', email: 'test@example.test' }) },
   });
   const res = response();
   await handler({ body: { userId: 'user', busId: 'bus' } }, res);
@@ -116,4 +122,23 @@ test('pickup requests retain cash without reserving seats', async () => {
   assert.equal(inserted.booking_type, 'pickup_request');
   assert.equal(inserted.seat_assignment, 'unassigned');
   assert.equal(inserted.seats.length, 0);
+});
+
+for (const scenario of [
+  { seats: [1], discountStatus: 'approved', status: 403 },
+  { seats: [5], discountStatus: 'pending', status: 403 },
+  { seats: [5, 6], discountStatus: 'approved', status: 409 },
+  { seats: [99], discountStatus: 'approved', status: 400 },
+]) test(`checkout rejects ineligible seats ${scenario.seats} (${scenario.discountStatus}) before charging`, async () => {
+  const h = checkoutHarness(scenario); const res = response(); const req = request(); req.body.seats = scenario.seats;
+  await h.handler(req, res);
+  assert.equal(res.code, scenario.status); assert.equal(h.inserts.length, 0); assert.equal(h.charges.length, 0);
+});
+test('checkout accepts one matching exclusive seat with regular companions', async () => {
+  const h = checkoutHarness(); const res = response(); const req = request(); req.body.seats = [5, 9];
+  await h.handler(req, res); assert.equal(res.code, 200); assert.equal(h.charges.length, 1);
+});
+test('checkout rejects forged passenger ID before any booking or payment', async () => {
+  const h = checkoutHarness(); const res = response(); const req = request(); req.body.userId = 'someone-else';
+  await h.handler(req, res); assert.equal(res.code, 403); assert.equal(h.inserts.length, 0); assert.equal(h.charges.length, 0);
 });
