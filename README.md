@@ -2,6 +2,27 @@
 
 A comprehensive REST API for managing bus tracking, booking, and fleet management operations. Built with Node.js, Express, and Supabase for real-time capabilities.
 
+## Gmail password recovery
+
+Set `EMAIL_USER` and `EMAIL_PASSWORD` (a Gmail App Password) in the backend `.env`
+and in the deployed backend environment variables. Keep both out of frontend
+variables and Git. `SUPABASE_SERVICE_ROLE_KEY` is required to update passwords.
+Restart/redeploy the backend after changing its variables. The host must allow
+outbound Gmail SMTP. Set the client's `VITE_API_BASE_URL` to this backend and
+rebuild the client when changing that URL.
+
+The existing `POST /api/auth/send-otp`, `/verify-otp`, and
+`/update-password-with-otp` endpoints retain their request fields. Gmail must
+accept the email before send returns success. Codes expire after 10 minutes;
+resend requires a 60-second cooldown. Five incorrect attempts lock the code.
+Verify the code before updating the password; successful updates consume it.
+Successful resends replace the previous code and require verification again.
+State is in memory: use one backend instance, and request a new code after a
+restart. Multiple replicas require a shared store with atomic updates first.
+
+Run `npm run test:password-reset` for the focused recovery tests. These tests
+mock email delivery and do not send real messages or change live passwords.
+
 ## 📋 Table of Contents
 
 - [Features](#-features)
@@ -713,4 +734,4 @@ For support and questions:
 
 ---
 
-**Built with ❤️ for efficient bus tracking and management** 
+**Built with ❤️ for efficient bus tracking and management**
