@@ -568,8 +568,11 @@ app.post('/api/client/booking/:id/confirm-payment', async (req, res) => {
     if (!session) {
       return res.status(404).json({ error: 'Stripe session not found' });
     }
-    if (session.payment_status !== 'paid' && session.status !== 'complete') {
+    if (session.payment_status !== 'paid') {
       return res.status(400).json({ error: 'Payment not completed' });
+    }
+    if (session.metadata?.bookingId !== id) {
+      return res.status(400).json({ error: 'Payment session does not match this booking' });
     }
     const { data: booking, error } = await supabase
       .from('bookings')
@@ -579,11 +582,15 @@ app.post('/api/client/booking/:id/confirm-payment', async (req, res) => {
     if (error || !booking) {
       return res.status(404).json({ error: 'Booking not found' });
     }
+    if (booking.checkout_session_id && booking.checkout_session_id !== session.id) {
+      return res.status(400).json({ error: 'Payment session does not match this booking' });
+    }
     if (booking.payment_status !== 'paid') {
-      await supabase
+      const { error: paymentUpdateError } = await supabase
         .from('bookings')
         .update({ payment_status: 'paid', payment_intent_id: session.payment_intent || null })
         .eq('id', id);
+      if (paymentUpdateError) throw paymentUpdateError;
     }
     // If receipt already sent, return success
     if (booking.receipt_sent) {
