@@ -52,14 +52,24 @@ test('direct regular booking rejects cash, omitted and online methods', async ()
   }
 });
 
-function checkoutHarness({ conflict = false, stripeFails = false, discountStatus = 'approved' } = {}) {
+function checkoutHarness({ conflict = false, stripeFails = false, stripeError = null, sessionSaveFails = false, discountStatus = 'approved' } = {}) {
   const inserts = [];
   const charges = [];
+  const updates = [];
+  const expired = [];
+  let availabilitySyncs = 0;
   const supabase = { from(table) {
     const query = {
       select() { return this; }, eq() { return this; },
       insert(payload) { if (table === 'bookings') inserts.push(payload); return this; },
-      update() { return this; },
+      update(payload) {
+        if (table === 'bookings') updates.push(payload);
+        this.updateResult = sessionSaveFails && payload.checkout_session_id
+          ? { error: new Error('Could not save checkout session') }
+          : { error: null, data: payload.status === 'cancelled' ? [{ id: 'new-reference' }] : null };
+        return this;
+      },
+      then(resolve, reject) { return Promise.resolve(this.updateResult || { error: null }).then(resolve, reject); },
       single: async () => ({ data: table === 'users' ? { id: 'user' } : table === 'buses' ? { route_id: 'route' } : table === 'routes' ? { name: 'Test', fare_per_seat: 100 } : { id: 'new-reference', ...inserts.at(-1) } }),
       maybeSingle: async () => ({ data: discountStatus === 'approved' ? { status: 'approved', type: 'pwd' } : null }),
     };
@@ -71,13 +81,16 @@ function checkoutHarness({ conflict = false, stripeFails = false, discountStatus
       actor: async () => ({ id: '12345678-1234-4123-8123-123456789012', email: 'test@example.test' }),
       context: async () => ({ bus: { total_seats: 40 }, category: discountStatus === 'approved' ? 'pwd' : null, otherPrioritySeat: false }),
     },
-    stripe: { checkout: { sessions: { create: async data => { charges.push(data); if (stripeFails) throw Error('Checkout unavailable'); return { id: 'session', url: 'https://checkout.example.test' }; } } } },
+    stripe: { checkout: { sessions: {
+      create: async data => { charges.push(data); if (stripeError) throw stripeError; if (stripeFails) throw Error('Checkout unavailable'); return { id: 'session', url: 'https://checkout.example.test' }; },
+      expire: async id => { expired.push(id); },
+    } } },
     findSeatConflicts: async () => conflict ? [1] : [],
     getTripAvailability: async () => ({ available_seats: 10, available_standing: 4 }),
-    syncBusAvailability: async () => {},
+    syncBusAvailability: async () => { availabilitySyncs++; },
     process: { env: { FRONTEND_URL: 'https://example.test' } }, console: { error() {} },
   });
-  return { handler, inserts, charges };
+  return { handler, inserts, charges, updates, expired, get availabilitySyncs() { return availabilitySyncs; } };
 }
 const request = () => ({ body: { userId: '12345678-1234-4123-8123-123456789012', email: 'test@example.test', busId: 'bus', seats: [9, 10], date: '2026-10-10', totalAmount: 1 } });
 test('checkout stores current server pricing and charges that same amount', async () => {
@@ -103,6 +116,25 @@ test('checkout provider failure returns an error, not success', async () => {
   const h = checkoutHarness({ stripeFails: true }); const res = response();
   await h.handler(request(), res);
   assert.equal(res.code, 500); assert.equal(res.body.error, 'Checkout unavailable');
+  assert.equal(h.updates.at(-1).status, 'cancelled');
+  assert.equal(h.availabilitySyncs, 2);
+});
+test('Stripe minimum rejection cancels the pending booking and returns a clear error', async () => {
+  const stripeError = Object.assign(new Error('Amount too small'), { code: 'amount_too_small' });
+  const h = checkoutHarness({ stripeError }); const res = response();
+  await h.handler(request(), res);
+  assert.equal(res.code, 500);
+  assert.match(res.body.error, /below the current card payment minimum/);
+  assert.equal(res.body.bookingReleased, true);
+  assert.equal(h.updates.at(-1).status, 'cancelled');
+});
+test('failed checkout session save expires Stripe session and releases booking', async () => {
+  const h = checkoutHarness({ sessionSaveFails: true }); const res = response();
+  await h.handler(request(), res);
+  assert.equal(res.code, 500);
+  assert.deepEqual(h.expired, ['session']);
+  assert.equal(h.updates.at(-1).status, 'cancelled');
+  assert.equal(h.availabilitySyncs, 2);
 });
 test('pickup requests retain cash without reserving seats', async () => {
   let handler; let inserted;

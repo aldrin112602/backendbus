@@ -949,6 +949,8 @@ app.patch('/api/client/booking/:id/pickup', async (req, res) => {
 
 // Create a Stripe Checkout session and a pending booking (online payment)
 app.post('/api/client/create-payment-session', async (req, res) => {
+  let pendingBooking = null;
+  let checkoutSession = null;
   try {
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured on server.' });
 
@@ -1058,6 +1060,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       .single();
 
     if (bookingErr) throw bookingErr;
+    pendingBooking = booking;
     await syncBusAvailability(busId);
 
     const lineAmount = Math.round(finalAmount * 100); // total in cents
@@ -1066,7 +1069,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       process.env.FRONTEND_URL ||
       req.headers.origin ||
       (req.get('referer') ? new URL(req.get('referer')).origin : 'https://auroride.xyz');
-    const session = await stripe.checkout.sessions.create({
+    checkoutSession = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
       line_items: [
@@ -1094,15 +1097,54 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     });
 
     // Store session id on booking for webhook correlation
-    await supabaseAdmin
+    if (!checkoutSession?.id || !checkoutSession?.url) {
+      throw new Error('Stripe did not return a checkout link.');
+    }
+    const { error: sessionSaveError } = await supabaseAdmin
       .from('bookings')
-      .update({ checkout_session_id: session.id, payment_intent_id: session.payment_intent || null })
+      .update({ checkout_session_id: checkoutSession.id, payment_intent_id: checkoutSession.payment_intent || null })
       .eq('id', booking.id);
+    if (sessionSaveError) throw sessionSaveError;
 
-    res.json({ url: session.url, sessionId: session.id });
+    res.json({ url: checkoutSession.url, sessionId: checkoutSession.id });
   } catch (error) {
     console.error('create-payment-session error', error);
-    res.status(seatErrorStatus(error)).json({ error: error.message || 'Failed to create payment session' });
+    let bookingReleased = !pendingBooking;
+    if (pendingBooking) {
+      let safeToCancel = true;
+      if (checkoutSession?.id) {
+        try {
+          await stripe.checkout.sessions.expire(checkoutSession.id);
+        } catch (expireError) {
+          safeToCancel = false;
+          console.error('Could not expire checkout session for booking', pendingBooking.id, expireError);
+        }
+      }
+      if (safeToCancel) {
+        try {
+          const { data: cancelledRows, error: cancelError } = await supabaseAdmin.from('bookings')
+            .update({ status: 'cancelled' })
+            .eq('id', pendingBooking.id)
+            .eq('payment_status', 'pending')
+            .select('id');
+          if (cancelError) throw cancelError;
+          if (!cancelledRows?.length) throw new Error('Pending booking could not be cancelled');
+          bookingReleased = true;
+          await syncBusAvailability(pendingBooking.bus_id);
+        } catch (cleanupError) {
+          console.error('Could not release pending booking', pendingBooking.id, cleanupError);
+        }
+      }
+    }
+    res.status(seatErrorStatus(error)).json({
+      error: bookingReleased
+        ? (error.code === 'amount_too_small'
+            ? 'This fare is below the current card payment minimum. Payment was not started and no booking was reserved.'
+            : (error.message || 'Failed to create payment session'))
+        : 'Payment could not start, but the pending booking could not be released automatically. Contact support before trying again.',
+      code: error.code || null,
+      bookingReleased,
+    });
   }
 });
 
