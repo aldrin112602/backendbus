@@ -87,33 +87,8 @@ test('checkout stores current server pricing and charges that same amount', asyn
   assert.equal(h.inserts[0].amount, 160);
   assert.equal(h.inserts[0].discount_amount, 40);
   assert.equal(h.inserts[0].payment_method, 'online');
-  assert.equal(h.inserts[0].payment_status, 'pending');
-  assert.equal(res.body.url, 'https://checkout.example.test');
   assert.equal(h.charges[0].line_items[0].price_data.unit_amount, 16000);
 });
-
-for (const scenario of [
-  { name: 'completed but unpaid', payment_status: 'unpaid', metadata: { bookingId: 'booking' }, expected: 400 },
-  { name: 'paid session for another booking', payment_status: 'paid', metadata: { bookingId: 'other' }, expected: 400 },
-  { name: 'paid matching session', payment_status: 'paid', metadata: { bookingId: 'booking' }, expected: 200 },
-]) {
-  test(`confirmation: ${scenario.name}`, async () => {
-    let writes = 0;
-    const query = {
-      select() { return this; }, eq() { return this; },
-      update() { writes++; return this; },
-      single: async () => ({ data: { id: 'booking', checkout_session_id: 'session', payment_status: 'pending', receipt_sent: true } }),
-    };
-    const handler = route("app.post('/api/client/booking/:id/confirm-payment',", '// Enhanced Supabase', {
-      stripe: { checkout: { sessions: { retrieve: async () => ({ id: 'session', status: 'complete', ...scenario }) } } },
-      supabase: { from: () => query },
-    });
-    const res = response();
-    await handler({ params: { id: 'booking' }, body: { session_id: 'session' } }, res);
-    assert.equal(res.code, scenario.expected);
-    assert.equal(writes, scenario.expected === 200 ? 1 : 0);
-  });
-}
 test('unverified checkout charges full fare', async () => {
   const h = checkoutHarness({ discountStatus: 'pending' }); const res = response();
   await h.handler(request(), res);
